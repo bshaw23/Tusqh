@@ -1,0 +1,22 @@
+This is a wrapper around libigl to use in C#. 
+The wrapper is significantly underdeveloped, but 
+is simply used for winding number computations.
+
+
+
+Download Eigen (currently using version 3.4.0, but maybe will work with newer version)
+
+navigate to libigl_wrapper/src
+Download libigl
+The following commit key seems to avoid compilation errors
+    1c8c6d38bad6ad4b962dce3d5f54834c8c46f5a2
+    i.e. 2023-10-06 by Alec Jacobson
+Modify text in the following file in libigl from "-" to "+"
+    case 3
+    {
+        - <blah blah blah>
+        + <Same as case 2>
+    }
+mkdir build
+enter build/
+cmake .. -D CMAKE_C_COMPILER=gcc -D CMAKE_CXX_COMPILER=g++ -D CMAKE_CXX_STANDARD=14
