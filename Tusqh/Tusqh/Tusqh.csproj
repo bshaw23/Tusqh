@@ -3,8 +3,8 @@
   <PropertyGroup>
     <TargetFramework>net7.0</TargetFramework>
     <Version>1.0</Version>
-    <Title>Sculpt2D</Title>
-    <Description>Description of Sculpt2D</Description>
+    <Title>Tusqh</Title>
+    <Description>Description of Tusqh</Description>
     <Configurations>Release;Debug</Configurations>
     <TargetExt>.gha</TargetExt>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
@@ -47,4 +47,11 @@
   <ItemGroup>
     <Compile Remove="Components\VolumeFractionsEdges.cs" />
   </ItemGroup>
+
+  <Target Name="CopyNativeLibs" AfterTargets="Build">
+    <Copy SourceFiles="..\libigl_wrapper\src\x64_lib\libigl_core.dll"
+          DestinationFolder="$(OutDir)"
+          Condition="Exists('..\libigl_wrapper\src\x64_lib\libigl_core.dll')" />
+  </Target>
+
 </Project>

@@ -1,22 +1,221 @@
-This is a wrapper around libigl to use in C#. 
-The wrapper is significantly underdeveloped, but 
+This is a wrapper around libigl to use in C#.
+The wrapper is significantly underdeveloped, but
 is simply used for winding number computations.
 
+The project has two build stages:
+
+  1. A C++ shared library (libigl_core.dll / .dylib / .so) that wraps libigl
+     functions, built with CMake.
+
+  2. A C# class library (wrapper.dll) that P/Invokes into libigl_core,
+     built with the .NET SDK.
+
+The C++ code is cross-platform. The same CMakeLists.txt and source files
+build on Windows (MSVC), macOS (clang++), and Linux (g++ or clang++).
 
 
-Download Eigen (currently using version 3.4.0, but maybe will work with newer version)
+== Source layout ==
 
-navigate to libigl_wrapper/src
-Download libigl
-The following commit key seems to avoid compilation errors
-    1c8c6d38bad6ad4b962dce3d5f54834c8c46f5a2
-    i.e. 2023-10-06 by Alec Jacobson
-Modify text in the following file in libigl from "-" to "+"
-    case 3
-    {
-        - <blah blah blah>
-        + <Same as case 2>
-    }
-mkdir build
-enter build/
-cmake .. -D CMAKE_C_COMPILER=gcc -D CMAKE_CXX_COMPILER=g++ -D CMAKE_CXX_STANDARD=14
+  eigen/                  Eigen header library (version 3.4.0 recommended)
+  src/
+    libigl/               libigl header library
+      include/igl/        igl headers
+    LibIGLWrapper.cpp     exported C functions (winding number, dot product)
+    LibIGLWrapper.h       platform export macros, SAL annotation stubs
+    UnixSal.h             SAL no-ops for non-Windows builds
+    CMakeLists.txt        native library build
+    x64_lib/              native library output (created by build_native.bat/.sh)
+      libigl_core.dll     Windows
+      libigl_core.dylib   macOS
+      libigl_core.so      Linux
+  wrapper/
+    core/
+      EigenBasic.cs       [DllImport] P/Invoke declarations
+      EigenMethods.cs     safe managed wrappers (EigenDenseUtilities)
+    bin/Release/net7.0/   C# library output (created by dotnet build)
+      wrapper.dll         the managed wrapper assembly
+      wrapper.pdb         debug symbols
+    wrapper.csproj        .NET 7 class library
+
+
+== Known-good libigl version ==
+
+  Commit: 1c8c6d38bad6ad4b962dce3d5f54834c8c46f5a2  (2023-10-06, Alec Jacobson)
+
+  Clone into src/libigl/:
+      git clone https://github.com/libigl/libigl src/libigl
+      cd src/libigl && git checkout 1c8c6d38bad6ad4b962dce3d5f54834c8c46f5a2
+
+
+════════════════════════════════════════
+  WINDOWS (VS Code + MSVC)
+════════════════════════════════════════
+
+Prerequisites
+  - Visual Studio Build Tools (any recent version)
+      winget install Microsoft.VisualStudio.2022.BuildTools
+      Select the "Desktop development with C++" workload.
+      Ninja is included automatically with this workload.
+  - CMake 3.10+
+      winget install Kitware.CMake
+  - .NET 7 SDK or later
+      winget install Microsoft.DotNet.SDK.7
+
+Step 1 — Build the native DLL
+  From the libigl_wrapper/ directory in any terminal (the script loads
+  the MSVC environment itself):
+
+      build_native.bat
+
+  Output: src/x64_lib/libigl_core.dll
+
+Step 2 — Build the C# wrapper
+      dotnet build wrapper/wrapper.csproj -c Release
+
+  Output: wrapper/bin/Release/net7.0/wrapper.dll
+
+VS Code tip
+  Open a new terminal with Ctrl+` — it opens as a Developer Command Prompt
+  (configured in settings.json), so cl.exe and cmake are on the PATH.
+  You can also run both build steps directly from the VS Code terminal.
+
+
+════════════════════════════════════════
+  macOS (VS Code + Xcode Command Line Tools)
+════════════════════════════════════════
+
+Prerequisites
+  - Xcode Command Line Tools (provides clang++)
+      xcode-select --install
+  - Homebrew  (https://brew.sh)
+  - CMake 3.10+ and Ninja
+      brew install cmake ninja
+  - .NET 7 SDK or later
+      brew install --cask dotnet-sdk
+      # or download from https://dotnet.microsoft.com/download
+
+Step 1 — Build the native dylib
+  From the libigl_wrapper/ directory:
+
+      chmod +x build_native.sh
+      ./build_native.sh
+
+  Output: src/x64_lib/libigl_core.dylib
+
+Step 2 — Build the C# wrapper
+      dotnet build wrapper/wrapper.csproj -c Release
+
+  Output: wrapper/bin/Release/net7.0/wrapper.dll
+
+VS Code tip
+  Install the "C/C++" and "C# Dev Kit" extensions. The integrated terminal
+  already has clang++ on the PATH after installing Command Line Tools.
+  CMake Tools extension can optionally configure and build the native
+  library from the IDE (point it at src/CMakeLists.txt).
+
+
+════════════════════════════════════════
+  LINUX (CMake + .NET SDK)
+════════════════════════════════════════
+
+Prerequisites (Ubuntu / Debian)
+      sudo apt update
+      sudo apt install build-essential cmake ninja-build
+
+  .NET 7 SDK or later — follow the official instructions for your distro:
+      https://learn.microsoft.com/dotnet/core/install/linux
+
+  For other distros substitute the appropriate package manager (dnf, pacman,
+  zypper, etc.) and package names (gcc-c++, cmake, etc.).
+
+Step 1 — Build the native .so
+  From the libigl_wrapper/ directory:
+
+      chmod +x build_native.sh
+      ./build_native.sh
+
+  Output: src/x64_lib/libigl_core.so
+
+Step 2 — Build the C# wrapper
+      dotnet build wrapper/wrapper.csproj -c Release
+
+  Output: wrapper/bin/Release/net7.0/wrapper.dll
+
+To rebuild from scratch on any Unix platform, delete src/build_unix/ and
+re-run build_native.sh.
+
+
+════════════════════════════════════════
+  HOW THE BUILD WORKS
+════════════════════════════════════════
+
+Native library (src/CMakeLists.txt)
+  CMake compiles LibIGLWrapper.cpp as a shared library named libigl_core
+  (CMAKE_SHARED_LIBRARY_PREFIX "" removes the default "lib" prefix on Unix
+  so the name matches what [DllImport("libigl_core")] expects on all
+  platforms).
+
+  Both build_native.bat (Windows) and build_native.sh (macOS/Linux) use
+  -G Ninja so all platforms get parallel incremental builds via the same
+  generator. On Windows, Ninja ships with the VS Build Tools C++ workload
+  and is added to PATH by vcvarsall.bat.
+
+  Three include paths are set:
+    ../eigen/             Eigen matrix library headers
+    .                     so #include "libigl/include/igl/..." resolves
+    ./libigl/include      so igl headers can #include <igl/...> internally
+
+  LibIGLWrapper.h selects the correct export macro per platform:
+    Windows:  __declspec(dllexport)
+    Unix:     __attribute__((visibility("default")))
+
+C# wrapper (wrapper/)
+  EigenBasic.cs declares [DllImport("libigl_core")] P/Invoke bindings.
+  .NET resolves the library name to:
+    Windows:  libigl_core.dll
+    macOS:    libigl_core.dylib
+    Linux:    libigl_core.so
+
+  EigenMethods.cs (EigenDenseUtilities) provides the public managed API:
+
+    Dot(ReadOnlySpan<double>, ReadOnlySpan<double>, int) -> double
+        Eigen vector dot product.
+
+    WindingNumber(verts, n_verts, vert_dim,
+                  faces, n_faces, face_dim,
+                  points, n_points, point_dim,
+                  winding_numbers)
+        igl::winding_number — batch winding numbers for query points
+        against a triangle mesh.
+
+    WindingNumberSlow(verts, n_verts, vert_dim,
+                      faces, n_faces, face_dim,
+                      point, point_dim) -> double
+        Single-point variant of WindingNumber.
+
+  All arrays are flat, row-major. Vertex/face/point data must be
+  pre-allocated by the caller; winding_numbers is written in-place.
+
+
+════════════════════════════════════════
+  USAGE EXAMPLE
+════════════════════════════════════════
+
+  Add a reference to wrapper.dll and ensure libigl_core.dll/.dylib/.so
+  sits in the same directory at runtime:
+
+      dotnet add reference path/to/wrapper.dll
+
+  using EigenWrapper.Eigen;
+
+  // Flat row-major arrays: N vertices (Nx3), M triangles (Mx3), P queries (Px3)
+  double[] verts  = ...;
+  int[]    faces  = ...;
+  double[] points = ...;
+  double[] wind   = new double[P];
+
+  EigenDenseUtilities.WindingNumber(
+      verts,  N, 3,
+      faces,  M, 3,
+      points, P, 3,
+      wind);
