@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Drawing.Printing;
 using System.Linq;
 using GH_IO.Serialization;
@@ -51,6 +52,7 @@ namespace Sculpt2D.Components
             pManager.AddNumberParameter("y distance", "ydist", "length of hexes in y", GH_ParamAccess.item);                        // 3
             pManager.AddNumberParameter("z distance", "zdist", "length of hexes in z", GH_ParamAccess.item);                        // 4
             pManager.AddMeshParameter("Visualization", "viz", "Way to visualize the mesh", GH_ParamAccess.list);                    // 5
+            pManager.AddTextParameter("Timings", "time", "Per-phase wall-clock timings in milliseconds", GH_ParamAccess.list);      // 6
         }
 
         private List<double> SubdivideDualIntervalList(List<double> pts)
@@ -86,6 +88,10 @@ namespace Sculpt2D.Components
         /// <param name="DA">The DA object is used to retrieve from inputs and store in outputs.</param>
         protected override void SolveInstance(IGH_DataAccess DA)
         {
+            Stopwatch total_timer = Stopwatch.StartNew();
+            Stopwatch phase_timer = Stopwatch.StartNew();
+            List<string> timings = new List<string>();
+
             Box box = new Box();
             int x_div = new int();
             int y_div = new int();
@@ -117,6 +123,9 @@ namespace Sculpt2D.Components
             DA.SetData(2, x_dist);
             DA.SetData(3, y_dist);
             DA.SetData(4, z_dist);
+
+            timings.Add($"01 inputs/setup: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             for (int x = 0; x < x_div; x++)
             {
@@ -194,6 +203,9 @@ namespace Sculpt2D.Components
             List<double> dual_yvals = SubdivideDualIntervalList(y_pts);
             List<double> dual_zvals = SubdivideDualIntervalList(z_pts);
 
+            timings.Add($"02 dual coordinate construction: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             // Create Dual Surface Mesh
             List<Line> mesh_grid = new List<Line>();
             for (int i = 0; i < dual_xvals.Count; ++i)
@@ -219,6 +231,9 @@ namespace Sculpt2D.Components
 
             var dual_mesh = Mesh.CreateFromLines(linecurves, 4, 1e-6);
             var topology_vertices = dual_mesh.TopologyVertices;
+
+            timings.Add($"03 line grid and dual mesh: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             // Build hexes as list of vertex indicies
             List<List<int>> hexes = new List<List<int>>();
@@ -263,6 +278,9 @@ namespace Sculpt2D.Components
                     }
                 }
             }
+
+            timings.Add($"04 hex connectivity ({hexes.Count:N0} hexes): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             List<Point3d> verts = new List<Point3d>();
             foreach (Point3d vert in topology_vertices)
@@ -336,9 +354,16 @@ namespace Sculpt2D.Components
                 }
             }
 
+            timings.Add($"05 vertices and boundary visualization: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             DA.SetDataList(0, verts);
             DA.SetDataList(1, hexes);
             DA.SetDataList(5, viz);
+            timings.Add($"06 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            total_timer.Stop();
+            timings.Add($"TOTAL (excluding timing output): {total_timer.Elapsed.TotalMilliseconds:F3} ms");
+            DA.SetDataList(6, timings);
         }
 
         /// <summary>

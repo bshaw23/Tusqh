@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using Grasshopper.Kernel;
@@ -38,6 +39,7 @@ namespace Sculpt2D.Components
         /// </summary>
         protected override void RegisterOutputParams(GH_Component.GH_OutputParamManager pManager)
         {
+            pManager.AddTextParameter("Timings", "time", "Per-phase wall-clock timings in milliseconds", GH_ParamAccess.list);
         }
 
         /// <summary>
@@ -46,6 +48,10 @@ namespace Sculpt2D.Components
         /// <param name="DA">The DA object is used to retrieve from inputs and store in outputs.</param>
         protected override void SolveInstance(IGH_DataAccess DA)
         {
+            Stopwatch total_timer = Stopwatch.StartNew();
+            Stopwatch phase_timer = Stopwatch.StartNew();
+            List<string> timings = new List<string>();
+
             List<Point4d> vertices = new List<Point4d>();
             List<List<int>> tets = new List<List<int>>();
             List<double> volume_fractions = new List<double>();
@@ -60,6 +66,9 @@ namespace Sculpt2D.Components
             DA.GetData(2, ref name);
             DA.GetData(3, ref path);
             DA.GetData(4, ref filtration);
+
+            timings.Add($"01 inputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             Dictionary<Tuple<int, int>, float> edges = new Dictionary<Tuple<int, int>, float>();
             Dictionary<Tuple<int, int, int>, float> faces = new Dictionary<Tuple<int, int, int>, float>();
@@ -197,6 +206,9 @@ namespace Sculpt2D.Components
                 if (!faces.ContainsKey(tuple))
                     faces.Add(tuple, v);
             }
+
+            timings.Add($"02 simplex construction ({edges.Count:N0} edges, {faces.Count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
             
             
 
@@ -258,6 +270,11 @@ namespace Sculpt2D.Components
                 }
                 
             }
+
+            timings.Add($"03 file writing: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            total_timer.Stop();
+            timings.Add($"TOTAL (excluding timing output): {total_timer.Elapsed.TotalMilliseconds:F3} ms");
+            DA.SetDataList(0, timings);
 
         }
 

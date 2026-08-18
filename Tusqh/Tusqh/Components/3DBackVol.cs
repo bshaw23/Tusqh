@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using EigenWrapper.Eigen;
@@ -53,6 +54,7 @@ namespace Sculpt2D.Components
             pManager.AddPointParameter("Sample Points", "pts", "List of sample points", GH_ParamAccess.list);                                       // 3
             pManager.AddNumberParameter("Winding Numbers", "wind", "List of winding numbers", GH_ParamAccess.list);                                 // 4
             pManager.AddIntegerParameter("Divisions", "divs", "List of x_div, y_div, and z_div", GH_ParamAccess.list);                              // 5
+            pManager.AddTextParameter("Timings", "time", "Per-phase wall-clock timings in milliseconds", GH_ParamAccess.list);                     // 6
         }
 
         enum MethodOfAverage : uint
@@ -79,6 +81,10 @@ namespace Sculpt2D.Components
         /// <param name="DA">The DA object is used to retrieve from inputs and store in outputs.</param>
         protected override void SolveInstance(IGH_DataAccess DA)
         {
+            Stopwatch total_timer = Stopwatch.StartNew();
+            Stopwatch phase_timer = Stopwatch.StartNew();
+            List<string> timings = new List<string>();
+
             Rhino.Geometry.Box box = new Rhino.Geometry.Box();
             int x_div = 0;
             int y_div = 0;
@@ -106,12 +112,18 @@ namespace Sculpt2D.Components
             if (!DA.GetData(9, ref avg_int))
                 avg_int = 0;
 
+            timings.Add($"01 inputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             List<Tuple<double, double, double>> vert_array = new List<Tuple<double, double, double>>();
             List<Tuple<int, int>> edge_array = new List<Tuple<int, int>>();
             List<Tuple<int, int, int>> triangle_array = new List<Tuple<int, int, int>>();
 
             MeshVertexList vertices = surface_mesh.Vertices;
             AlephSupport.ProcessMesh(surface_mesh, out vert_array, out triangle_array);
+
+            timings.Add($"02 surface mesh conversion: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             Mesh background_mesh = Rhino.Geometry.Mesh.CreateFromBox(box, x_div, y_div, z_div);
             var x_interval = box.X;
@@ -132,6 +144,10 @@ namespace Sculpt2D.Components
             List<Point3d> centroids = new List<Point3d>();
             List<Tuple<double, double, double>> querry_pts = new List<Tuple<double, double, double>>(x_div * y_div * z_div * x_pts * y_pts * z_pts);
             List<double> pt_winding = new List<double>(querry_pts.Capacity);
+
+            timings.Add($"03 background mesh/setup: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             for (int x = 0; x < x_div; x++)
             { 
                 for (int y = 0; y < y_div; y++)
@@ -171,6 +187,9 @@ namespace Sculpt2D.Components
                 }
             }
 
+            timings.Add($"04 sample point generation: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             // reindex to put into LibIGL---this code shouldn't ever change
             List<double> vert_list = new List<double>();
             List<int> triangle_list = new List<int>();
@@ -179,6 +198,9 @@ namespace Sculpt2D.Components
 
             // Column major population
             AlephSupport.ColumnMajorConstruction(vert_array, triangle_array, querry_pts, out vert_list, out triangle_list, out querry_list);
+
+            timings.Add($"05 column-major packing: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             // output to C++ code
             if (compute_vols)
@@ -190,6 +212,9 @@ namespace Sculpt2D.Components
                                                     System.Runtime.InteropServices.CollectionsMarshal.AsSpan(triangle_list), triangle_array.Count, 3,
                                                     System.Runtime.InteropServices.CollectionsMarshal.AsSpan(querry_list), querry_pts.Count, 3,
                                                     System.Runtime.InteropServices.CollectionsMarshal.AsSpan(winding));
+
+                timings.Add($"06 native winding numbers ({querry_pts.Count:N0} points): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+                phase_timer.Restart();
 
 
                 double divisor = (double)x_pts * (double)y_pts * (double)z_pts;
@@ -215,6 +240,15 @@ namespace Sculpt2D.Components
                     volume_fractions.Add(volume_fraction);
                     counter += n_pts;
                 }
+
+                timings.Add($"07 volume-fraction aggregation: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+                phase_timer.Restart();
+            }
+            else
+            {
+                timings.Add("06 native winding numbers: skipped (no surface mesh)");
+                timings.Add("07 volume-fraction aggregation: skipped (no surface mesh)");
+                phase_timer.Restart();
             }
 
             List<int> divs = new List<int> { x_div, y_div, z_div };
@@ -228,6 +262,11 @@ namespace Sculpt2D.Components
                 DA.SetDataList(1, volume_fractions);
                 DA.SetDataList(4, pt_winding);
             }
+
+            timings.Add($"08 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            total_timer.Stop();
+            timings.Add($"TOTAL (excluding timing output): {total_timer.Elapsed.TotalMilliseconds:F3} ms");
+            DA.SetDataList(6, timings);
         }
 
         /// <summary>

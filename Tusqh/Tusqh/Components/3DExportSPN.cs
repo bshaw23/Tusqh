@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using Grasshopper.Kernel;
@@ -35,10 +36,15 @@ namespace Sculpt2D.Components
         {
             pManager.AddTextParameter("Status", "status", "Status message after writing", GH_ParamAccess.item);           // 0
             pManager.AddTextParameter("Sculpt Command", "cmd", "Suggested sculpt.exe command line", GH_ParamAccess.item); // 1
+            pManager.AddTextParameter("Timings", "time", "Per-phase wall-clock timings in milliseconds", GH_ParamAccess.list); // 2
         }
 
         protected override void SolveInstance(IGH_DataAccess DA)
         {
+            Stopwatch total_timer = Stopwatch.StartNew();
+            Stopwatch phase_timer = Stopwatch.StartNew();
+            List<string> timings = new List<string>();
+
             List<double> volume_fractions = new List<double>();
             List<int> divisions = new List<int>();
             double threshold = 0.5;
@@ -78,10 +84,18 @@ namespace Sculpt2D.Components
             string spn_name = Path.GetFileName(file_path);
             string cmd = $"sculpt.exe -j 8 -x {nx} -y {ny} -z {nz} -isp \"{spn_name}\" -p 1";
 
+            timings.Add($"01 inputs/validation: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             if (!write)
             {
                 DA.SetData(0, $"Set Write=true to write the file. Mode: {(is_2d ? "2D planar extrusion (nz=1)" : "3D")}");
                 DA.SetData(1, cmd);
+                total_timer.Stop();
+                timings.Add("02 SPN formatting: skipped (Write=false)");
+                timings.Add("03 file writing: skipped (Write=false)");
+                timings.Add($"TOTAL (excluding timing output): {total_timer.Elapsed.TotalMilliseconds:F3} ms");
+                DA.SetDataList(2, timings);
                 return;
             }
 
@@ -130,7 +144,10 @@ namespace Sculpt2D.Components
                     }
                 }
 
+                timings.Add($"02 SPN formatting ({expected:N0} cells): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+                phase_timer.Restart();
                 File.WriteAllText(file_path, sb.ToString());
+                timings.Add($"03 file writing: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
                 DA.SetData(0, $"Written {(is_2d ? nx * ny : expected)} cells ({(is_2d ? "2D extruded to nz=1" : "3D")}) to {file_path}");
             }
             catch (Exception ex)
@@ -140,6 +157,9 @@ namespace Sculpt2D.Components
             }
 
             DA.SetData(1, cmd);
+            total_timer.Stop();
+            timings.Add($"TOTAL (excluding timing output): {total_timer.Elapsed.TotalMilliseconds:F3} ms");
+            DA.SetDataList(2, timings);
         }
 
         protected override System.Drawing.Bitmap Icon => null;

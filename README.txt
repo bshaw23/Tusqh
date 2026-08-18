@@ -13,7 +13,7 @@ Build Instructions
 2. Build LibIGLWrapper.sln found in Tusqh/libigl_wrapper/build
 3. Build libigl_wapper.sln found in Tusqh/libigl_wrapper/
 If using windows
-3a. Copy libigl_core.dll and libigl_core.lib found in Tusqh/libigl_wrapper/build/Debug 
+3a. Copy libigl_core.dll and libigl_core.lib found in Tusqh/libigl_wrapper/build/Debug
 3b. Paste them to Tusqh/libigl_wrapper/wrapper/bin/Debug/net7.0
 4. Build Tusqh.sln found in Tusqh/Tusqh
 

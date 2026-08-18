@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics.Metrics;
+using System.Diagnostics;
 using System.Drawing.Printing;
 using System.Linq;
 using System.Numerics;
@@ -56,6 +57,7 @@ namespace Sculpt2D.Components
             pManager.AddGenericParameter("Vertices", "verts", "Vertices of triangulated dual mesh", GH_ParamAccess.list);
             pManager.AddGenericParameter("Tets", "tets", "Tetrahedron", GH_ParamAccess.list);
             pManager.AddMeshParameter("Visualization", "viz", "Visualization of the mesh", GH_ParamAccess.item);
+            pManager.AddTextParameter("Timings", "time", "Per-phase wall-clock timings in milliseconds", GH_ParamAccess.list);
         }
 
         /// <summary>
@@ -64,6 +66,10 @@ namespace Sculpt2D.Components
         /// <param name="DA">The DA object is used to retrieve from inputs and store in outputs.</param>
         protected override void SolveInstance(IGH_DataAccess DA)
         {
+            Stopwatch total_timer = Stopwatch.StartNew();
+            Stopwatch phase_timer = Stopwatch.StartNew();
+            List<string> timings = new List<string>();
+
             List<Point3d> vertices = new List<Point3d>();
             List<List<int>> hexes = new List<List<int>>();
             List<Point3d> centroids = new List<Point3d>();
@@ -86,6 +92,9 @@ namespace Sculpt2D.Components
             DA.GetData(8, ref use_min);
             DA.GetData(9, ref viz);
 
+            timings.Add($"01 inputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             Dictionary<Point3d, Tuple<int, double>> Points = new Dictionary<Point3d, Tuple<int, double>>();
 
             List<Point3d> dual_centroids = new List<Point3d>();
@@ -100,6 +109,9 @@ namespace Sculpt2D.Components
 
                 dual_centroids.Add(centroid);
             }
+
+            timings.Add($"02 dual centroids: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             // Move the volume fraction to the appropriate vertex
             for(int j = 0; j < vertices.Count; j++)
@@ -120,6 +132,9 @@ namespace Sculpt2D.Components
                 }
                 Points.Add(vert, new Tuple<int, double>(j, volume_fractions[idx]));
             }
+
+            timings.Add($"03 map volume fractions to vertices: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             List<List<int>> tets = new List<List<int>>();
             int counter = 0;
@@ -184,6 +199,9 @@ namespace Sculpt2D.Components
                 counter++;
             }
 
+            timings.Add($"04 tetrahedralization ({tets.Count:N0} tets): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             List<Point4d> points = new List<Point4d>();
             if (negative)
             {
@@ -192,6 +210,7 @@ namespace Sculpt2D.Components
                     points.Add(new Point4d(kvp.Key.X, kvp.Key.Y, kvp.Key.Z, -1 * kvp.Value.Item2));
                 }
             }
+
             else
             {
                 foreach (var kvp in Points)
@@ -199,6 +218,9 @@ namespace Sculpt2D.Components
                     points.Add(new Point4d(kvp.Key.X, kvp.Key.Y, kvp.Key.Z, kvp.Value.Item2));
                 }
             }
+
+            timings.Add($"05 weighted vertex construction: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             List<Mesh> visualization = new List<Mesh>();
             if (viz)
@@ -261,9 +283,16 @@ namespace Sculpt2D.Components
                 }
             }
 
+            timings.Add($"06 visualization: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             DA.SetDataList(0, points);
             DA.SetDataList(1, tets);
             DA.SetDataList(2, visualization);
+            timings.Add($"07 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            total_timer.Stop();
+            timings.Add($"TOTAL (excluding timing output): {total_timer.Elapsed.TotalMilliseconds:F3} ms");
+            DA.SetDataList(3, timings);
         }
 
         /// <summary>

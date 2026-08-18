@@ -10,6 +10,7 @@ set(EIGEN_DIRECTORY ../eigen/ CACHE STRING "Eigen directory.  The directory spec
 include_directories(${EIGEN_DIRECTORY})
 set(LIBIGL_DIRECTORY . CACHE STRING "LibIGL directory.")
 include_directories(${LIBIGL_DIRECTORY})
+include_directories(${LIBIGL_DIRECTORY}/libigl/include)
 
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
