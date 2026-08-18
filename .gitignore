@@ -1,0 +1,54 @@
+# Visual Studio and local IDE state
+**/.vs/
+**/.idea/
+**/.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# .NET build output
+**/bin/
+**/obj/
+**/artifacts/
+**/TestResults/
+**/BenchmarkDotNet.Artifacts/
+
+# CMake and Ninja output
+**/build/
+**/build-*/
+**/build_*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/CTestTestfile.cmake
+**/build.ninja
+**/.ninja_deps
+**/.ninja_log
+*.obj
+*.o
+*.exp
+*.ilk
+
+# Generated Grasshopper and symbol files outside normal build folders
+*.gha
+*.pdb
+
+# Downloaded/generated libigl dependencies
+/Tusqh/libigl_wrapper/eigen/
+/Tusqh/libigl_wrapper/src/libigl/
+/Tusqh/libigl_wrapper/src/x64_lib/
+
+# Personal tool configuration
+**/.claude/
+.DS_Store
+Thumbs.db
+
+# Local benchmark and solver output
+/Tusqh/Tusqh/run-output/
+/Tusqh/Tusqh/profiling-output/
+
+# Locally cloned Aleph source and its build/install trees
+/Tusqh/extensions/aleph/
+/Tusqh/extensions/_build/
+/Tusqh/extensions/_install/
