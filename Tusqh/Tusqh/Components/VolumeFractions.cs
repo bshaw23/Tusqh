@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using Eto.Forms;
 using Grasshopper.Kernel;
 using Grasshopper.Kernel.Geometry.Delaunay;
@@ -36,10 +37,12 @@ namespace Sculpt2D.Components
             pManager.AddSurfaceParameter("Surface", "S", "Surface of interest being bounded", GH_ParamAccess.list);
             pManager.AddBooleanParameter("Winding Number", "wn", "Use winding number or use default computations in Rhino", GH_ParamAccess.item);
             pManager.AddBooleanParameter("Reverse Orientation", "rev", "Reverse orientation of the boundary curve", GH_ParamAccess.item);
+            pManager.AddBooleanParameter("Accelerate", "accel", "True (default) uses the hierarchical WindingNumberFast2D acceleration; false falls back to the brute-force WindingNumber, for comparison", GH_ParamAccess.item);
             pManager[3].Optional = true;
             pManager[4].Optional = true;
             pManager[5].Optional = true;
             pManager[6].Optional = true;
+            pManager[7].Optional = true;
         }
 
         /// <summary>
@@ -53,6 +56,7 @@ namespace Sculpt2D.Components
             pManager.AddCurveParameter("Boundary curves", "bc", "Boundary curves of the mesh used", GH_ParamAccess.list);
             pManager.AddPointParameter("Face Sample Points", "sample", "sample points of the face", GH_ParamAccess.list);
             pManager.AddNumberParameter("Point Winding Number", "wpt", "Computed winding number of the point", GH_ParamAccess.list);
+            pManager.AddTextParameter("Timings", "time", "Per-phase wall-clock timings in milliseconds", GH_ParamAccess.list);
         }
 
         /// <summary>
@@ -61,6 +65,10 @@ namespace Sculpt2D.Components
         /// <param name="DA">The DA object is used to retrieve from inputs and store in outputs.</param>
         protected override void SolveInstance(IGH_DataAccess DA)
         {
+            Stopwatch total_timer = Stopwatch.StartNew();
+            Stopwatch phase_timer = Stopwatch.StartNew();
+            List<string> timings = new List<string>();
+
             Mesh background_grid = new Mesh();
             int u_pts = new int();
             int v_pts = new int();
@@ -69,6 +77,7 @@ namespace Sculpt2D.Components
 
             bool use_winding_number = false;
             bool reverse_boundary_orient = false;
+            bool accelerate = true;
 
             DA.GetData(0, ref background_grid);
             DA.GetData(1, ref u_pts);
@@ -81,6 +90,11 @@ namespace Sculpt2D.Components
                 use_winding_number = false;
             if (!DA.GetData(6, ref reverse_boundary_orient))
                 reverse_boundary_orient = false;
+            if (!DA.GetData(7, ref accelerate))
+                accelerate = true;
+
+            timings.Add($"01 inputs ({background_grid.Faces.Count:N0} background faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             List<double> volume_fractions = new List<double>();
             List<double> surface_volume_fractions = new List<double>();
@@ -116,10 +130,15 @@ namespace Sculpt2D.Components
 
             bool point_in = false;
 
+            Stopwatch grid_gen_timer = new Stopwatch();
+            Stopwatch mesh_check_timer = new Stopwatch();
+            Stopwatch brep_check_timer = new Stopwatch();
+
             if (!use_winding_number)
             {
                 foreach (MeshFace face in background_grid.Faces)
                 {
+                    grid_gen_timer.Start();
                     // indeces for corners of face starting at bottom left and goin counter clockwise
                     A = face.A;
                     B = face.B;
@@ -161,8 +180,11 @@ namespace Sculpt2D.Components
                         }
                     }
 
+                    grid_gen_timer.Stop();
+
                     points_in = 0.0;
 
+                    mesh_check_timer.Start();
                     foreach (Point3d test_point in point_grid)
                     {
                         point_in = false;
@@ -193,10 +215,13 @@ namespace Sculpt2D.Components
                     var divisor = 0.0;
                     divisor = u_pts_double * v_pts_double;
 
+                    mesh_check_timer.Stop();
+
                     volume_fraction = points_in / divisor;
                     volume_fractions.Add(volume_fraction);
 
                     points_in = 0.0;
+                    brep_check_timer.Start();
                     foreach (Point3d test_point in point_grid)
                     {
                         point_in = false;
@@ -216,9 +241,16 @@ namespace Sculpt2D.Components
                         }
                     }
 
+                    brep_check_timer.Stop();
+
                     surface_volume_fraction = points_in / divisor;
                     surface_volume_fractions.Add(surface_volume_fraction);
                 }
+
+                timings.Add($"02a sample grid generation (accumulated): {grid_gen_timer.Elapsed.TotalMilliseconds:F3} ms");
+                timings.Add($"02b mesh.ClosestPoint containment checks (accumulated): {mesh_check_timer.Elapsed.TotalMilliseconds:F3} ms");
+                timings.Add($"02c brep.ClosestPoint containment checks (accumulated): {brep_check_timer.Elapsed.TotalMilliseconds:F3} ms");
+                phase_timer.Restart();
             }
             else
             {
@@ -297,6 +329,9 @@ namespace Sculpt2D.Components
                     }
                 }
 
+                timings.Add($"03 boundary extraction ({vert_array.Count:N0} verts, {edge_array.Count:N0} edges): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+                phase_timer.Restart();
+
                 // points to querry in the background mesh... just sample the centroid for now
                 List<Tuple<double, double>> querry_pts = new List<Tuple<double, double>>(background_grid.Faces.Count*u_pts*v_pts);
                 foreach (MeshFace face in background_grid.Faces)
@@ -339,6 +374,9 @@ namespace Sculpt2D.Components
                         }
                     }
                 }
+
+                timings.Add($"04 sample point generation ({querry_pts.Count:N0} points): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+                phase_timer.Restart();
 
                 /*
                 // points to querry in the background mesh... just sample the centroid for now
@@ -412,14 +450,30 @@ namespace Sculpt2D.Components
                     }
                 }
 
+                timings.Add($"05 column-major packing: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+                phase_timer.Restart();
+
                 // output to C++ code
                 List<double> winding = new List<double>(querry_pts.Count);
                 for (int i = 0; i < querry_pts.Count; ++i)
                     winding.Add(0);
-                EigenDenseUtilities.WindingNumber(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(vert_list), vert_array.Count, 2,
-                                                  System.Runtime.InteropServices.CollectionsMarshal.AsSpan(edge_list), edge_array.Count, 2,
-                                                  System.Runtime.InteropServices.CollectionsMarshal.AsSpan(querry_list), querry_pts.Count, 2,
-                                                  System.Runtime.InteropServices.CollectionsMarshal.AsSpan(winding));
+                if (accelerate)
+                {
+                    EigenDenseUtilities.WindingNumberFast2D(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(vert_list), vert_array.Count, 2,
+                                                      System.Runtime.InteropServices.CollectionsMarshal.AsSpan(edge_list), edge_array.Count, 2,
+                                                      System.Runtime.InteropServices.CollectionsMarshal.AsSpan(querry_list), querry_pts.Count, 2,
+                                                      System.Runtime.InteropServices.CollectionsMarshal.AsSpan(winding));
+                }
+                else
+                {
+                    EigenDenseUtilities.WindingNumber(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(vert_list), vert_array.Count, 2,
+                                                      System.Runtime.InteropServices.CollectionsMarshal.AsSpan(edge_list), edge_array.Count, 2,
+                                                      System.Runtime.InteropServices.CollectionsMarshal.AsSpan(querry_list), querry_pts.Count, 2,
+                                                      System.Runtime.InteropServices.CollectionsMarshal.AsSpan(winding));
+                }
+
+                timings.Add($"06 native winding numbers, {(accelerate ? "accelerated" : "brute force")} ({querry_pts.Count:N0} points): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+                phase_timer.Restart();
 
                 double divisor = u_pts_double * v_pts_double;
 
@@ -446,6 +500,8 @@ namespace Sculpt2D.Components
                 DA.SetDataList(3, boundary_edges);
                 //DA.SetDataList(4, plpts);
 
+                timings.Add($"07 volume-fraction aggregation: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+                phase_timer.Restart();
             }
 
             DA.SetDataList(0, volume_fractions);
@@ -455,6 +511,10 @@ namespace Sculpt2D.Components
             DA.SetDataList(4, pt_grid);
             DA.SetDataList(5, pt_winding);
 
+            timings.Add($"08 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            total_timer.Stop();
+            timings.Add($"TOTAL: {total_timer.Elapsed.TotalMilliseconds:F3} ms");
+            DA.SetDataList(6, timings);
         }
 
         /// <summary>

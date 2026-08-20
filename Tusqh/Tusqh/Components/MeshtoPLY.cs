@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 
 using Grasshopper.Kernel;
@@ -34,6 +35,7 @@ namespace Sculpt2D.Components
         /// </summary>
         protected override void RegisterOutputParams(GH_Component.GH_OutputParamManager pManager)
         {
+            pManager.AddTextParameter("Timings", "time", "Per-phase wall-clock timings in milliseconds", GH_ParamAccess.list);
         }
 
         /// <summary>
@@ -42,6 +44,10 @@ namespace Sculpt2D.Components
         /// <param name="DA">The DA object is used to retrieve from inputs and store in outputs.</param>
         protected override void SolveInstance(IGH_DataAccess DA)
         {
+            Stopwatch total_timer = Stopwatch.StartNew();
+            Stopwatch phase_timer = Stopwatch.StartNew();
+            List<string> timings = new List<string>();
+
             Rhino.Geometry.Mesh mesh = new Rhino.Geometry.Mesh();
             string name = null;
             string path = null;
@@ -50,6 +56,9 @@ namespace Sculpt2D.Components
             DA.GetData(0, ref mesh);
             DA.GetData(1, ref name);
             DA.GetData(2, ref path);
+
+            timings.Add($"01 inputs ({mesh.Vertices.Count:N0} verts, {mesh.Faces.Count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             // Write the string array to a new file named "WriteLines.txt".
             using (StreamWriter filename = new StreamWriter(Path.Combine(path, name)))
@@ -73,6 +82,11 @@ namespace Sculpt2D.Components
                 foreach (var f in mesh.Faces)
                     filename.WriteLine("3 " + f.A + " " + f.B + " " + f.C);
             }
+
+            timings.Add($"02 file writing: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            total_timer.Stop();
+            timings.Add($"TOTAL: {total_timer.Elapsed.TotalMilliseconds:F3} ms");
+            DA.SetDataList(0, timings);
         }
 
         /// <summary>

@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using GH_IO.Serialization;
@@ -50,6 +51,7 @@ namespace Sculpt2D.Components
             pManager.AddLineParameter("Edge Visualization", "e_viz", "Edge visualization", GH_ParamAccess.list);
             pManager.AddMeshParameter("Face Visualization", "f_viz", "Face visualization", GH_ParamAccess.item);
             pManager.AddMeshParameter("Final Mesh", "mesh", "Final anti-aliasing", GH_ParamAccess.item);
+            pManager.AddTextParameter("Timings", "time", "Per-phase wall-clock timings in milliseconds", GH_ParamAccess.list);
         }
 
         /// <summary>
@@ -58,6 +60,10 @@ namespace Sculpt2D.Components
         /// <param name="DA">The DA object is used to retrieve from inputs and store in outputs.</param>
         protected override void SolveInstance(IGH_DataAccess DA)
         {
+            Stopwatch total_timer = Stopwatch.StartNew();
+            Stopwatch phase_timer = Stopwatch.StartNew();
+            List<string> timings = new List<string>();
+
             Mesh background = new Mesh();
             List<double> winding = new List<double>();
             List<Point3d> sample_points = new List<Point3d>();
@@ -94,6 +100,9 @@ namespace Sculpt2D.Components
                 face_volume_fractions.Add(volume_fraction);
                 counter += n_pts;
             }
+
+            timings.Add($"01 inputs + face volume fractions ({background.Faces.Count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             MeshTopologyVertexList verts = background.TopologyVertices;
 
@@ -179,6 +188,9 @@ namespace Sculpt2D.Components
                 edge_winding_numbers[t4].AddRange(D);
             }
 
+            timings.Add($"02 vertex/edge winding aggregation: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             // Get vertex volume fractions
             List<double> vertex_volume_fractions = new List<double>();
             for (int i = 0; i < verts.Count; i++)
@@ -202,8 +214,12 @@ namespace Sculpt2D.Components
                 edge_volume_fractions.Add(kvp.Key, volume_fraction);
             }
 
+            timings.Add($"03 vertex/edge volume fraction computation: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             // Output vertex list and vertex visualization
             List<int> verts_to_keep = new List<int>();
+            HashSet<int> verts_to_keep_set = new HashSet<int>();
             List<Point3d> vert_viz = new List<Point3d>();
             int init_count = verts.Count;
             for (int i = init_count - 1; i >= 0; i--)
@@ -211,36 +227,54 @@ namespace Sculpt2D.Components
                 if (vertex_volume_fractions[i] >= volume_cutoff)
                 {
                     verts_to_keep.Add(i);
+                    verts_to_keep_set.Add(i);
                     vert_viz.Add(verts[i]);
                 }
             }
-            
+
 
             // Output edge list and edge visualization
             List<Tuple<int, int>> edges_to_keep = new List<Tuple<int, int>>();
+            HashSet<Tuple<int, int>> edges_to_keep_set = new HashSet<Tuple<int, int>>();
             List<Line> edge_viz = new List<Line>();
             foreach (var kvp in edge_volume_fractions)
             {
                 if (kvp.Value >= volume_cutoff)
                 {
                     edges_to_keep.Add(kvp.Key);
+                    edges_to_keep_set.Add(kvp.Key);
                     edge_viz.Add(new Line(verts[kvp.Key.Item1], verts[kvp.Key.Item2]));
                 }
             }
 
+            timings.Add($"04 verts/edges output construction: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             init_count = background.Faces.Count;
             List<int> faces_to_keep = new List<int>();
+            HashSet<int> faces_to_keep_set = new HashSet<int>();
+            List<int> faces_to_remove = new List<int>();
             Mesh sculpted_mesh = background.DuplicateMesh();
             for (int i = init_count - 1; i >= 0; --i)
             {
                 if (face_volume_fractions[i] < volume_cutoff)
-                    sculpted_mesh.Faces.RemoveAt(i, true);
+                    faces_to_remove.Add(i);
                 else
+                {
                     faces_to_keep.Add(i);
+                    faces_to_keep_set.Add(i);
+                }
             }
+            // Batch removal: RemoveAt(i, true) recompacts the face array on
+            // every call, so removing faces one at a time here cost
+            // O(faces^2). DeleteFaces does it in a single pass.
+            sculpted_mesh.Faces.DeleteFaces(faces_to_remove);
 
             Mesh face_viz = sculpted_mesh.DuplicateMesh();
             DA.SetData(5, face_viz);
+
+            timings.Add($"05 initial face removal ({faces_to_remove.Count:N0} removed): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             List<HashSet<int>> components = new List<HashSet<int>>();
             HashSet<int> visited = new HashSet<int>();
@@ -261,7 +295,7 @@ namespace Sculpt2D.Components
                     List<int> connected_faces = Functions.GetAdjacentFaces(face, background);
                     foreach(int i in connected_faces)
                     {
-                        if (!component.Contains(i) && faces_to_keep.Contains(i))
+                        if (!component.Contains(i) && faces_to_keep_set.Contains(i))
                         {
                             queue.Enqueue(i);
                             component.Add(i);
@@ -271,6 +305,9 @@ namespace Sculpt2D.Components
 
                 components.Add(component);
             }
+
+            timings.Add($"06 first BFS: connected components ({components.Count:N0} found): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             // Identify exterior edges
             HashSet<Tuple<int, int>> interior_edges = new HashSet<Tuple<int, int>>();
@@ -299,8 +336,30 @@ namespace Sculpt2D.Components
                     exterior_edges.Add(edge);
             }
 
+            timings.Add($"07 exterior edge identification ({exterior_edges.Count:N0} edges): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             // Get Paths between components
+            //
+            // FindAllPaths used to rebuild its adjacency list from
+            // exterior_edges on every single (start,end) call; exterior_edges
+            // doesn't change across this whole loop, so it's built once here
+            // instead. path_cache memoizes exact (start,end) pairs: a given
+            // vertex can only be a "start" candidate for the one component it
+            // belongs to, so within one (i,j) iteration a pair can't repeat --
+            // but two components that are face-disjoint can still share a
+            // vertex at a shared corner, so the same ordered pair can
+            // legitimately recur across different (i,j) iterations. This is
+            // exact memoization of a pure function (same edges, same
+            // endpoints -> same paths), not an approximation, so it can't
+            // change which paths get found or returned.
+            Dictionary<int, List<int>> exterior_adjacency = Functions.BuildAdjacencyList(exterior_edges);
+            Dictionary<Tuple<int, int>, List<List<int>>> path_cache = new Dictionary<Tuple<int, int>, List<List<int>>>();
             List<List<List<List<int>>>> vertex_paths = new List<List<List<List<int>>>>();
+            int find_all_paths_calls = 0;
+            int find_all_paths_cache_hits = 0;
+            int total_paths_returned = 0;
+            int max_paths_single_call = 0;
             for (int i = 0; i < components.Count; i++)
             {
                 HashSet<int> component1 = components[i];
@@ -355,6 +414,19 @@ namespace Sculpt2D.Components
                         }
                     }
 
+                    // NOTE: start_idxs/end_idxs are intentionally left
+                    // un-deduplicated -- a vertex touched by two exterior
+                    // edges into the same component is processed once per
+                    // occurrence below, and each occurrence's paths feed
+                    // ConnectByVertexPath downstream, so removing duplicates
+                    // here would change the resulting mesh (fewer connect
+                    // operations), not just the run time. path_cache below
+                    // skips the repeated DFS search itself for a duplicate
+                    // (start,end) pair, but the cached paths are still
+                    // re-iterated and re-processed downstream for each
+                    // occurrence -- not free, just far cheaper than
+                    // re-searching.
+
                     // Now the edges are initialized I would have to start at each initialized edge and see if it creates a path to component2
                     List<List<List<int>>> components_paths = new List<List<List<int>>>();
                     for (int k = 0; k < start_idxs.Count; k++)
@@ -363,7 +435,23 @@ namespace Sculpt2D.Components
                         {
                             int start = start_idxs[k];
                             int end = end_idxs[l];
-                            List<List<int>> all_paths = Functions.FindAllPaths(exterior_edges, start, end);
+                            find_all_paths_calls++;
+
+                            Tuple<int, int> cache_key = new Tuple<int, int>(start, end);
+                            List<List<int>> all_paths;
+                            if (path_cache.TryGetValue(cache_key, out all_paths))
+                            {
+                                find_all_paths_cache_hits++;
+                            }
+                            else
+                            {
+                                all_paths = Functions.FindAllPaths(exterior_adjacency, start, end);
+                                path_cache[cache_key] = all_paths;
+                            }
+
+                            total_paths_returned += all_paths.Count;
+                            if (all_paths.Count > max_paths_single_call)
+                                max_paths_single_call = all_paths.Count;
 
                             List<List<int>> paths = new List<List<int>>();
                             foreach (var path in all_paths)
@@ -380,6 +468,15 @@ namespace Sculpt2D.Components
                     vertex_paths.Add(components_paths);
                 }
             }
+
+            timings.Add($"08 inter-component path finding ({components.Count:N0} components, "
+                + $"{find_all_paths_calls:N0} (start,end) pairs evaluated, "
+                + $"{path_cache.Count:N0} unique pairs actually searched, "
+                + $"{find_all_paths_cache_hits:N0} cache hits, "
+                + $"{total_paths_returned:N0} total paths returned, "
+                + $"{max_paths_single_call:N0} max paths from one pair, "
+                + $"{exterior_edges.Count:N0} exterior edges): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             Dictionary<Point3d, int> location_to_index = new Dictionary<Point3d, int>();
             for (int v = 0; v < sculpted_mesh.Vertices.Count; v++)
@@ -409,6 +506,9 @@ namespace Sculpt2D.Components
             }
 
             sculpted_mesh.Compact();
+
+            timings.Add($"09 trapezoid connection (ConnectByVertexPath): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             components = new List<HashSet<int>>();
             visited = new HashSet<int>();
@@ -441,19 +541,57 @@ namespace Sculpt2D.Components
                 components.Add(component);
             }
 
+            timings.Add($"10 second BFS: connected components ({components.Count:N0} found, {sculpted_mesh.Faces.Count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             MeshTopologyVertexList topology_verts = sculpted_mesh.TopologyVertices;
+
+            // Match each surviving sculpted face back to its original
+            // background face index. A face that survived unmodified has
+            // vertex coordinates bit-identical to its background source
+            // (DuplicateMesh + face-list-only removal never moves a
+            // vertex), so its centroid is bit-identical too -- rounding
+            // it to the same precision FacesAreEqual already matches at
+            // (0.001) buckets each sculpted face with its true match
+            // deterministically, regardless of the grid being uniform,
+            // non-uniform-but-rectangular, or general (even concave)
+            // structured quads. The bucket is only ever a candidate
+            // prefilter: FacesAreEqual still does the exact match, so a
+            // rounding collision between unrelated cells (rare, and only
+            // possible for degenerate/adjacent cells) just means checking
+            // a couple of candidates instead of one -- it can't produce a
+            // wrong match. This turns an O(sculpted x background)
+            // comparison into O(sculpted + background).
+            Dictionary<Point3d, List<int>> background_centroid_to_idx = new Dictionary<Point3d, List<int>>();
+            for (int j = 0; j < background.Faces.Count; j++)
+            {
+                Point3d key = Functions.RoundPoint(AlephSupport.GetCentroid(background.Faces[j], background));
+                if (!background_centroid_to_idx.TryGetValue(key, out List<int> bucket))
+                {
+                    bucket = new List<int>();
+                    background_centroid_to_idx[key] = bucket;
+                }
+                bucket.Add(j);
+            }
 
             Dictionary<int, int> face_idx_to_background_idx = new Dictionary<int, int>();
             for (int i = 0; i < sculpted_mesh.Faces.Count; i++)
             {
                 MeshFace face1 = sculpted_mesh.Faces[i];
-                for (int j = 0; j < background.Faces.Count; j++) 
+                Point3d key = Functions.RoundPoint(AlephSupport.GetCentroid(face1, sculpted_mesh));
+                if (background_centroid_to_idx.TryGetValue(key, out List<int> candidates))
                 {
-                    MeshFace face2 = background.Faces[j];
-                    if (AlephSupport.FacesAreEqual(face1, face2, sculpted_mesh, background))
-                        face_idx_to_background_idx.Add(i, j);
+                    foreach (int j in candidates)
+                    {
+                        MeshFace face2 = background.Faces[j];
+                        if (AlephSupport.FacesAreEqual(face1, face2, sculpted_mesh, background))
+                            face_idx_to_background_idx.Add(i, j);
+                    }
                 }
             }
+
+            timings.Add($"11 face-to-background matching ({sculpted_mesh.Faces.Count:N0} x {background.Faces.Count:N0}): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             HashSet<int> remove_faces = new HashSet<int>();
             foreach(var component in components)
@@ -477,12 +615,12 @@ namespace Sculpt2D.Components
 
                         foreach(int v in face_verts)
                         {
-                            if (verts_to_keep.Contains(v))
+                            if (verts_to_keep_set.Contains(v))
                                 subcells_counter++;
                         }
                         foreach(var edge in face_edges)
                         {
-                            if (edges_to_keep.Contains(edge))
+                            if (edges_to_keep_set.Contains(edge))
                                 subcells_counter++;
                         }
                     }
@@ -495,13 +633,12 @@ namespace Sculpt2D.Components
                 }
             }
 
-            for (int i = sculpted_mesh.Faces.Count - 1; i >= 0; --i)
-            {
-                if (remove_faces.Contains(i))
-                {
-                    sculpted_mesh.Faces.RemoveAt(i, true);
-                }
-            }
+            // Same batch-removal fix as above: DeleteFaces in one pass
+            // instead of RemoveAt(i, true) recompacting per call.
+            sculpted_mesh.Faces.DeleteFaces(remove_faces.ToList());
+
+            timings.Add($"12 small-component removal ({remove_faces.Count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             DA.SetDataList(0, verts_to_keep);
             DA.SetDataList(1, edges_to_keep);
@@ -509,6 +646,11 @@ namespace Sculpt2D.Components
             DA.SetDataList(3, vert_viz);
             DA.SetDataList(4, edge_viz);
             DA.SetData(6, sculpted_mesh);
+
+            timings.Add($"13 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            total_timer.Stop();
+            timings.Add($"TOTAL: {total_timer.Elapsed.TotalMilliseconds:F3} ms");
+            DA.SetDataList(7, timings);
         }
 
         /// <summary>

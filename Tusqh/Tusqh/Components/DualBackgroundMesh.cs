@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing.Printing;
 using System.Linq;
 
@@ -42,6 +43,7 @@ namespace Sculpt2D.Components
         {
             pManager.AddMeshParameter("Regular Grid", "grid", "2D rectangular grid", GH_ParamAccess.item);
             pManager.AddMeshParameter("Dual Grid", "dual", "2D dual grid", GH_ParamAccess.item);
+            pManager.AddTextParameter("Timings", "time", "Per-phase wall-clock timings in milliseconds", GH_ParamAccess.list);
         }
 
 
@@ -62,6 +64,10 @@ namespace Sculpt2D.Components
         /// to store data in output parameters.</param>
         protected override void SolveInstance(IGH_DataAccess DA)
         {
+            Stopwatch total_timer = Stopwatch.StartNew();
+            Stopwatch phase_timer = Stopwatch.StartNew();
+            List<string> timings = new List<string>();
+
             Rhino.Geometry.Rectangle3d bounding_box = new Rectangle3d();
             int x = new int();
             int y = new int();
@@ -77,6 +83,9 @@ namespace Sculpt2D.Components
             Rhino.Geometry.Interval X = new Interval(corner.X, x_corner.X);
             Rhino.Geometry.Interval Y = new Interval(corner.Y, y_corner.Y);
             var regular_mesh = Rhino.Geometry.Mesh.CreateFromPlane(rectangle, X, Y, x, y);
+
+            timings.Add($"01 inputs + regular mesh creation ({x}x{y}): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             List<double> x_pts = new List<double>();
             List<double> y_pts = new List<double>();
@@ -95,6 +104,8 @@ namespace Sculpt2D.Components
             x_pts.Sort();
             y_pts.Sort();
 
+            timings.Add($"02 boundary point extraction ({x_pts.Count:N0} x, {y_pts.Count:N0} y): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             List<double> dual_xvals = SubdivideDualIntervalList(x_pts);
             List<double> dual_yvals = SubdivideDualIntervalList(y_pts);
@@ -114,7 +125,13 @@ namespace Sculpt2D.Components
             for (int i = 0; i < mesh_grid.Count; ++i)
                 linecurves[i] = (mesh_grid[i].ToNurbsCurve());
 
+            timings.Add($"03 dual grid line construction ({mesh_grid.Count:N0} lines): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             var dual_mesh = Mesh.CreateFromLines(linecurves, 4, 1e-6);
+
+            timings.Add($"04 dual mesh creation (CreateFromLines): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
 
             //for(int i = 0; i < regular_mesh.TopologyVertices.Count; ++i)
             //{
@@ -180,6 +197,11 @@ namespace Sculpt2D.Components
 
             DA.SetData(0, regular_mesh);
             DA.SetData(1, dual_mesh);
+
+            timings.Add($"05 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            total_timer.Stop();
+            timings.Add($"TOTAL: {total_timer.Elapsed.TotalMilliseconds:F3} ms");
+            DA.SetDataList(2, timings);
         }
 
         /// <summary>

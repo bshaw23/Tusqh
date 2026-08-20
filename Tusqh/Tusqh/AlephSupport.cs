@@ -416,13 +416,11 @@ namespace Sculpt2D
             }
         }
 
-        public static void GetQuerryPoints(Mesh grid, int x_pts, int y_pts, 
+        public static void GetQuerryPoints(Mesh grid, int x_pts, int y_pts,
             out List<Point3d> centroids, out List<Point3d> sample_points, out List<Tuple<double, double>> querry_pts)
         {
-            List<Point3d> point_grid = new List<Point3d>();
-            List<Point3d> pt_grid = new List<Point3d>();
+            List<Point3d> pt_grid = new List<Point3d>(grid.Faces.Count * x_pts * y_pts);
             centroids = new List<Point3d>();
-            sample_points = new List<Point3d>();
 
             // points to querry in the background mesh
             querry_pts = new List<Tuple<double, double>>(grid.Faces.Count * x_pts * y_pts);
@@ -447,8 +445,6 @@ namespace Sculpt2D
                 double u_segments = u_dist / (double)x_pts;
                 double v_segments = v_dist / (double)y_pts;
 
-                point_grid.Clear();
-
                 for (int i = 0; i < x_pts; i++)
                 {
                     double x = 0.0;
@@ -465,12 +461,12 @@ namespace Sculpt2D
                         pt_grid.Add(new Point3d(x, y, 0));
                     }
                 }
-
-                sample_points = new List<Point3d>(pt_grid);
             }
 
-
-            
+            // Only the final, fully-accumulated point grid is ever needed by
+            // callers; building it once here (rather than re-copying the
+            // growing list on every face) avoids an accidental O(faces^2) cost.
+            sample_points = pt_grid;
         }
 
         public static void ColumnMajorConstruction(List<Tuple<double, double>> vert_array, 
@@ -3565,8 +3561,13 @@ namespace Sculpt2D
                 return connected_faces;
             }
 
-            public static List<List<int>> FindAllPaths(HashSet<Tuple<int, int>> edges, 
-                int start, int end)
+            // Builds an undirected adjacency list from a set of edges. Split
+            // out of FindAllPaths so callers that need to search many
+            // (start,end) pairs against the same edge set (e.g. every
+            // candidate pair between two components) can build this once
+            // instead of once per search -- rebuilding it per call was
+            // O(edges) of pure waste repeated for every candidate pair.
+            public static Dictionary<int, List<int>> BuildAdjacencyList(HashSet<Tuple<int, int>> edges)
             {
                 Dictionary<int, List<int>> adjacency_list = new Dictionary<int, List<int>>();
 
@@ -3581,6 +3582,15 @@ namespace Sculpt2D
                     adjacency_list[edge.Item2].Add(edge.Item1);
                 }
 
+                return adjacency_list;
+            }
+
+            // Same search as the (edges, start, end) overload below, but
+            // takes an already-built adjacency list (see BuildAdjacencyList)
+            // instead of rebuilding one from scratch on every call.
+            public static List<List<int>> FindAllPaths(Dictionary<int, List<int>> adjacency_list,
+                int start, int end)
+            {
                 List<List<int>> all_paths = new List<List<int>>();
                 List<int> current_path = new List<int>();
                 HashSet<int> visited = new HashSet<int>();
@@ -3588,6 +3598,12 @@ namespace Sculpt2D
                 DFS(adjacency_list, start, end, visited, current_path, all_paths);
 
                 return all_paths;
+            }
+
+            public static List<List<int>> FindAllPaths(HashSet<Tuple<int, int>> edges,
+                int start, int end)
+            {
+                return FindAllPaths(BuildAdjacencyList(edges), start, end);
             }
 
             public static void DFS(Dictionary<int, List<int>> adjacency_list, 

@@ -8,6 +8,9 @@
 #include "libigl/include/igl/WindingNumberAABB.h"
 #include "libigl/include/igl/WindingNumberMethod.h"
 #include "libigl/include/igl/WindingNumberTree.h"
+#include "libigl/include/igl/parallel_for.h"
+
+#include "WindingNumberAABB2D.h"
 
 using namespace std;
 using namespace Eigen;
@@ -66,6 +69,33 @@ EXPORT_API(void) windingnumber_(_In_ double* v,const int row_v, const int col_v,
 }
 
 
+
+// 2D-accelerated counterpart to windingnumber_: same signature and same
+// per-edge igl::signed_angle formula (so results match windingnumber_'s
+// F.cols()==2 brute-force path exactly), but evaluated via a recursive
+// spatial hierarchy (WindingNumberAABB2D) instead of summing every edge
+// for every query point. Only valid for 2D edge input (col_v == 2,
+// col_f == 2); use windingnumber_ for triangle meshes, which already gets
+// the analogous 3D acceleration (WindingNumberAABB) for free.
+EXPORT_API(void) windingnumberfast2d_(_In_ double* v, const int row_v, const int col_v, _In_ int* e, const int row_e, const int col_e, _In_ double* o, const int row_o, const int col_o, _Out_ double* wind)
+{
+    Map<const MatrixXd> vertsmap(v, row_v, col_v);
+    Map<const MatrixXi> edgesmap(e, row_e, col_e);
+    Map<const MatrixXd> ptsmap(o, row_o, col_o);
+
+    MatrixXd verts = vertsmap;
+    MatrixXi edges = edgesmap;
+    MatrixXd pts = ptsmap;
+
+    WindingNumberAABB2D tree(verts, edges);
+    tree.grow();
+
+    Map<VectorXd> result(wind, row_o);
+    igl::parallel_for(row_o, [&](const int i)
+    {
+        result(i) = tree.winding_number(pts.row(i));
+    }, 10000);
+}
 
 EXPORT_API(double) windingnumberslow_(_In_ double* v,const int row_v, const int col_v, _In_ int* f, const int row_f, const int col_f, _In_ double* o, const int col_o)
 {
