@@ -64,6 +64,29 @@ namespace Sculpt2D.Components
             Stopwatch phase_timer = Stopwatch.StartNew();
             List<string> timings = new List<string>();
 
+            try
+            {
+                SolveInstanceCore(DA, timings, total_timer, phase_timer);
+            }
+            catch (Exception ex)
+            {
+                // Same blind spot MakeManifold had: Timings is only ever
+                // published at the very end of a normal run, so a failure
+                // partway through previously left zero visibility into
+                // which phase it reached or why. This publishes whatever
+                // phases DID complete, plus the actual exception detail,
+                // instead of Grasshopper's generic "Solution exception"
+                // message being the only thing visible.
+                timings.Add($"EXCEPTION after {total_timer.Elapsed.TotalMilliseconds:F3} ms: "
+                    + $"{ex.GetType().Name}: {ex.Message}");
+                timings.Add($"STACK TRACE: {ex.StackTrace}");
+                AddRuntimeMessage(GH_RuntimeMessageLevel.Error, $"{ex.GetType().Name}: {ex.Message}");
+                DA.SetDataList(7, timings);
+            }
+        }
+
+        private void SolveInstanceCore(IGH_DataAccess DA, List<string> timings, Stopwatch total_timer, Stopwatch phase_timer)
+        {
             Mesh background = new Mesh();
             List<double> winding = new List<double>();
             List<Point3d> sample_points = new List<Point3d>();
@@ -81,6 +104,38 @@ namespace Sculpt2D.Components
             DA.GetData(5, ref y_pts);
             DA.GetData(6, ref consider_components);
             DA.GetData(7, ref remove_components);
+
+            // Grid spacing: NOT diagnostic-only -- this is the actual
+            // geometric input ConnectBridgeGraph uses to position every
+            // template vertex, so it's derived from an actual background
+            // quad's own corners (face[0].A -> B for the X vector, A -> D
+            // for the Y vector) instead of assuming background vertex
+            // index 1 is the +X neighbor of index 0. That assumption is
+            // what Mesh.CreateFromPlane's raster-scan ordering happens to
+            // produce, but it isn't a documented guarantee; a specific
+            // face's own corner structure (A/B/C/D going around the quad)
+            // is the same convention already relied on throughout this
+            // file (e.g. the interior_edges A-B/B-C/D-C/A-D pairing a few
+            // lines up), so this doesn't add a new assumption, just a more
+            // direct source for one that was already being made.
+            MeshFace grid_face = background.Faces[0];
+            Point3d grid_a = background.Vertices[grid_face.A];
+            Point3d grid_b = background.Vertices[grid_face.B];
+            Point3d grid_d = background.Vertices[grid_face.D];
+            Vector3d grid_x_vector = grid_b - grid_a;
+            Vector3d grid_y_vector = grid_d - grid_a;
+
+            double diag_x_dist = grid_x_vector.X;
+            double diag_y_dist = grid_y_vector.Y;
+
+            bool grid_axis_aligned = Math.Abs(grid_x_vector.Y) < 1e-5 && Math.Abs(grid_y_vector.X) < 1e-5;
+            double diag_dist_delta = Math.Abs(Math.Abs(diag_x_dist) - Math.Abs(diag_y_dist));
+            timings.Add($"00 STAGE-0 DIAGNOSTIC grid spacing: x_dist={diag_x_dist:G17}, y_dist={diag_y_dist:G17}, "
+                + $"abs(abs(x_dist)-abs(y_dist))={diag_dist_delta:G17}, "
+                + $"grid_x_vector={grid_x_vector}, grid_y_vector={grid_y_vector}, dot={Vector3d.Multiply(grid_x_vector, grid_y_vector):G17}"
+                + (grid_axis_aligned ? "" : ", WARNING: background face[0] is not axis-aligned -- straight/turn classification assumes axis-aligned grid")
+                + (diag_dist_delta < 1e-5 ? " -- WITHIN 1e-5: square-cell orientation bug would have been ACTIVE on this grid under the old classifier" : " -- outside 1e-5 tolerance")
+                + ": 0.000 ms");
 
             List<double> face_volume_fractions = new List<double>();
             double divisor = (double)x_pts * (double)y_pts;
@@ -268,12 +323,34 @@ namespace Sculpt2D.Components
             // Batch removal: RemoveAt(i, true) recompacts the face array on
             // every call, so removing faces one at a time here cost
             // O(faces^2). DeleteFaces does it in a single pass.
-            sculpted_mesh.Faces.DeleteFaces(faces_to_remove);
+            //
+            // compact = false is required here, not optional: the single-
+            // argument overload defaults to compact = true, which silently
+            // deletes any vertex that loses all its incident faces and
+            // renumbers the survivors. ConnectBridgeGraph (below, in phase
+            // 09) relies on background vertex index i still being
+            // sculpted_mesh vertex index i -- true right after
+            // DuplicateMesh(), but false the moment a compacting delete
+            // runs. Compacting here caused "Index was outside the bounds
+            // of the array" inside AddBridgeEdgeTemplate on every tested
+            // resolution. The deferred sculpted_mesh.Compact() later
+            // (after all bridge/template geometry has been added, once
+            // background-index alignment is no longer needed) is the
+            // correct place for that cleanup, not here.
+            sculpted_mesh.Faces.DeleteFaces(faces_to_remove, false);
+
+            if (sculpted_mesh.Vertices.Count != background.Vertices.Count)
+            {
+                timings.Add($"WARNING: sculpted_mesh.Vertices.Count ({sculpted_mesh.Vertices.Count:N0}) != "
+                    + $"background.Vertices.Count ({background.Vertices.Count:N0}) after phase 05 -- "
+                    + "ConnectBridgeGraph's background-index assumption will be violated");
+            }
 
             Mesh face_viz = sculpted_mesh.DuplicateMesh();
             DA.SetData(5, face_viz);
 
-            timings.Add($"05 initial face removal ({faces_to_remove.Count:N0} removed): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            timings.Add($"05 initial face removal ({faces_to_remove.Count:N0} removed, "
+                + $"{sculpted_mesh.Vertices.Count:N0} vertices preserved): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
 
             List<HashSet<int>> components = new List<HashSet<int>>();
@@ -478,36 +555,32 @@ namespace Sculpt2D.Components
                 + $"{exterior_edges.Count:N0} exterior edges): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
 
-            Dictionary<Point3d, int> location_to_index = new Dictionary<Point3d, int>();
-            for (int v = 0; v < sculpted_mesh.Vertices.Count; v++)
-            {
-                Point3d vert = sculpted_mesh.Vertices[v];
-                Point3d rounded_vert = Functions.RoundPoint(vert);
+            // Flatten every accepted path (across every component pair)
+            // into one list before meshing anything: ConnectBridgeGraph
+            // consolidates them into a single set of unique bridge edges
+            // internally, so a duplicate or repeatedly-cached path can no
+            // longer stack duplicate trapezoids the way calling
+            // ConnectByVertexPath once per path used to. No RoundPoint-based
+            // location_to_index is built any more -- every function
+            // ConnectBridgeGraph calls (AddBridgeEdgeTemplate,
+            // MeshComponentFace, MeshPinchVertexX/Y) identifies vertices
+            // through the structural TemplateVertexKey registry instead.
+            List<List<int>> all_accepted_paths = new List<List<int>>();
+            foreach (List<List<List<int>>> paths in vertex_paths)
+                foreach (var start in paths)
+                    foreach (List<int> path in start)
+                        all_accepted_paths.Add(path);
 
-                location_to_index.Add(rounded_vert, v);
-            }
-
-            int path_counter = 0;
-            Mesh trapazoids = new Mesh();
-            for (int i = 0; i < components.Count; i++)
-            {
-                for(int j = i + 1; j < components.Count; j++)
-                {
-                    List<List<List<int>>> paths = vertex_paths[path_counter];
-                    foreach (var start in paths)
-                    {
-                        foreach(List<int> path in start)
-                        {
-                            Functions.ConnectByVertexPath(background, sculpted_mesh, faces_to_keep, path, location_to_index);
-                        }
-                    }
-                    path_counter++;
-                }
-            }
+            List<string> bridge_diagnostics = new List<string>();
+            Functions.ConnectBridgeGraph(background, sculpted_mesh, faces_to_keep, all_accepted_paths,
+                diag_x_dist, diag_y_dist, bridge_diagnostics);
 
             sculpted_mesh.Compact();
 
-            timings.Add($"09 trapezoid connection (ConnectByVertexPath): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            timings.Add($"09 trapezoid connection (ConnectBridgeGraph, {all_accepted_paths.Count:N0} paths flattened): "
+                + $"{phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            foreach (string diag in bridge_diagnostics)
+                timings.Add($"09b {diag}");
             phase_timer.Restart();
 
             components = new List<HashSet<int>>();
@@ -643,6 +716,129 @@ namespace Sculpt2D.Components
 
             timings.Add($"12 small-component removal ({remove_faces.Count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
+
+            // Stage 0 diagnostic (no behavior change): report face-type
+            // and manifoldness statistics on the final published mesh, so
+            // "it looks like triangles in the viewport" can be checked
+            // against the actual face data (overlapping quads vs. genuine
+            // triangles) rather than inferred from appearance alone.
+            {
+                int diag_triangle_faces = 0;
+                int diag_quad_faces = 0;
+                int diag_degenerate_faces = 0;
+                Dictionary<Tuple<int, int, int, int>, int> diag_face_key_counts =
+                    new Dictionary<Tuple<int, int, int, int>, int>();
+
+                // Scale-relative area tolerance: a face is only "degenerate
+                // by area" if it's near-zero relative to an actual cell,
+                // not relative to an arbitrary fixed constant that might be
+                // wrong for this grid's units.
+                double diag_area_tolerance = 1e-6 * Math.Abs(diag_x_dist * diag_y_dist);
+
+                foreach (MeshFace f in sculpted_mesh.Faces)
+                {
+                    if (f.IsTriangle)
+                        diag_triangle_faces++;
+                    else
+                        diag_quad_faces++;
+
+                    int[] idxs = f.IsTriangle
+                        ? new int[] { f.A, f.B, f.C }
+                        : new int[] { f.A, f.B, f.C, f.D };
+
+                    bool repeated_index = idxs.Distinct().Count() != idxs.Length;
+
+                    // Shoelace formula on the flat XY projection (valid --
+                    // this whole system lives on a flat background plane):
+                    // catches distinct-but-collinear/near-zero-area faces
+                    // that a repeated-index check alone would miss.
+                    double signed_area2 = 0;
+                    for (int pi = 0; pi < idxs.Length; pi++)
+                    {
+                        Point3d pcur = sculpted_mesh.Vertices[idxs[pi]];
+                        Point3d pnext = sculpted_mesh.Vertices[idxs[(pi + 1) % idxs.Length]];
+                        signed_area2 += pcur.X * pnext.Y - pnext.X * pcur.Y;
+                    }
+                    bool near_zero_area = Math.Abs(signed_area2) * 0.5 < diag_area_tolerance;
+
+                    if (repeated_index || near_zero_area)
+                        diag_degenerate_faces++;
+
+                    int[] sorted_idxs = (int[])idxs.Clone();
+                    Array.Sort(sorted_idxs);
+                    Tuple<int, int, int, int> key = sorted_idxs.Length == 3
+                        ? new Tuple<int, int, int, int>(sorted_idxs[0], sorted_idxs[1], sorted_idxs[2], -1)
+                        : new Tuple<int, int, int, int>(sorted_idxs[0], sorted_idxs[1], sorted_idxs[2], sorted_idxs[3]);
+
+                    diag_face_key_counts.TryGetValue(key, out int diag_existing);
+                    diag_face_key_counts[key] = diag_existing + 1;
+                }
+
+                int diag_duplicate_faces = diag_face_key_counts.Values.Where(c => c > 1).Sum(c => c - 1);
+
+                int diag_non_manifold_edges = 0;
+                MeshTopologyEdgeList diag_edges = sculpted_mesh.TopologyEdges;
+                for (int de = 0; de < diag_edges.Count; de++)
+                {
+                    if (diag_edges.GetConnectedFaces(de).Length > 2)
+                        diag_non_manifold_edges++;
+                }
+
+                // Non-manifold VERTEX check (distinct from non-manifold
+                // edges): a "bowtie" -- two face fans touching at only one
+                // shared vertex -- can have every incident edge at exactly
+                // 2 faces (or fewer at a boundary) while the vertex itself
+                // is still non-manifold, because its incident faces don't
+                // form one connected fan. For each topology vertex, build
+                // the adjacency graph among its own connected faces (two
+                // faces adjacent if they share one of the vertex's own
+                // connected edges) and check it's a single component.
+                int diag_non_manifold_vertices = 0;
+                MeshTopologyVertexList diag_verts = sculpted_mesh.TopologyVertices;
+                for (int dv = 0; dv < diag_verts.Count; dv++)
+                {
+                    int[] vfaces = diag_verts.ConnectedFaces(dv);
+                    if (vfaces.Length <= 1)
+                        continue;
+
+                    int[] vedges = diag_verts.ConnectedEdges(dv);
+                    Dictionary<int, int> face_to_local = new Dictionary<int, int>();
+                    for (int fi = 0; fi < vfaces.Length; fi++)
+                        face_to_local[vfaces[fi]] = fi;
+
+                    // Union-find over the vertex's own incident faces.
+                    int[] parent = new int[vfaces.Length];
+                    for (int pi = 0; pi < parent.Length; pi++) parent[pi] = pi;
+                    Func<int, int> find = null;
+                    find = (x) => parent[x] == x ? x : (parent[x] = find(parent[x]));
+
+                    foreach (int ve in vedges)
+                    {
+                        int[] edge_faces = diag_edges.GetConnectedFaces(ve);
+                        if (edge_faces.Length != 2)
+                            continue;
+                        if (face_to_local.TryGetValue(edge_faces[0], out int f0) && face_to_local.TryGetValue(edge_faces[1], out int f1))
+                        {
+                            int r0 = find(f0), r1 = find(f1);
+                            if (r0 != r1) parent[r0] = r1;
+                        }
+                    }
+
+                    HashSet<int> roots = new HashSet<int>();
+                    for (int pi = 0; pi < parent.Length; pi++)
+                        roots.Add(find(pi));
+
+                    if (roots.Count > 1)
+                        diag_non_manifold_vertices++;
+                }
+
+                timings.Add($"12b STAGE-0 DIAGNOSTIC final mesh ({sculpted_mesh.Faces.Count:N0} faces): "
+                    + $"triangle_faces={diag_triangle_faces:N0}, quad_faces={diag_quad_faces:N0}, "
+                    + $"degenerate_faces={diag_degenerate_faces:N0}, duplicate_faces={diag_duplicate_faces:N0}, "
+                    + $"non_manifold_edges={diag_non_manifold_edges:N0}, non_manifold_vertices={diag_non_manifold_vertices:N0}"
+                    + $": {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+                phase_timer.Restart();
+            }
 
             DA.SetDataList(0, verts_to_keep);
             DA.SetDataList(1, edges_to_keep);

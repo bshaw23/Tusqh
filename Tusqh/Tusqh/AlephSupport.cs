@@ -3636,314 +3636,486 @@ namespace Sculpt2D
                 current_path.RemoveAt(current_path.Count - 1);
             }
 
-            public static void ConnectByVertexPath(Mesh background, Mesh sculpted_mesh, List<int> faces_to_keep, List<int> path, Dictionary<Point3d, int> location_to_index)
+            // Stage 1 replacement for the old per-path ConnectByVertexPath.
+            //
+            // Template vertices (1/3-cell corner points and 1/2-cell axis
+            // midpoints) are identified structurally, relative to whichever
+            // background vertex they're built from, instead of by rounding
+            // world coordinates to 3 decimals. This makes vertex identity
+            // exact (every offset is a rational multiple of x_dist/y_dist,
+            // so integer direction codes have no floating-point ambiguity)
+            // and removes any dependency on absolute world-coordinate scale.
+            public enum TemplateVertexKind { Background, CornerThird, AxisHalf }
+
+            public struct TemplateVertexKey : IEquatable<TemplateVertexKey>
             {
-                double x_dist = new double();
-                double y_dist = new double();
-                for (int i = 0; i < background.Vertices.Count; i++)
+                public TemplateVertexKind Kind;
+                public int AnchorBackgroundVertex;
+                public int DirectionX; // -1, 0, or +1
+                public int DirectionY; // -1, 0, or +1
+
+                public TemplateVertexKey(TemplateVertexKind kind, int anchor, int dx, int dy)
                 {
-                    Point3d vertex = background.Vertices[i];
-                    if (i == 1)
+                    Kind = kind;
+                    AnchorBackgroundVertex = anchor;
+                    DirectionX = dx;
+                    DirectionY = dy;
+                }
+
+                public bool Equals(TemplateVertexKey other) =>
+                    Kind == other.Kind && AnchorBackgroundVertex == other.AnchorBackgroundVertex
+                    && DirectionX == other.DirectionX && DirectionY == other.DirectionY;
+
+                public override bool Equals(object obj) => obj is TemplateVertexKey other && Equals(other);
+
+                public override int GetHashCode() =>
+                    HashCode.Combine(Kind, AnchorBackgroundVertex, DirectionX, DirectionY);
+            }
+
+            // Anchor positions are read from sculpted_mesh, not background:
+            // sculpted_mesh starts as background.DuplicateMesh(), so for
+            // every background-derived index i (which is all that's ever
+            // used as an anchor), sculpted_mesh.Vertices[i] ==
+            // background.Vertices[i] exactly -- no separate background
+            // reference is needed here, and this stays correct regardless
+            // of how many template vertices have since been appended.
+            public static Point3d ResolveTemplateVertexKey(TemplateVertexKey key, Mesh sculpted_mesh, double x_dist, double y_dist)
+            {
+                Point3d anchor = sculpted_mesh.Vertices[key.AnchorBackgroundVertex];
+                if (key.Kind == TemplateVertexKind.Background)
+                    return anchor;
+
+                double scale = key.Kind == TemplateVertexKind.CornerThird ? (1.0 / 3.0) : (1.0 / 2.0);
+                return new Point3d(anchor.X + key.DirectionX * x_dist * scale, anchor.Y + key.DirectionY * y_dist * scale, anchor.Z);
+            }
+
+            public static int GetOrAddTemplateVertex(Dictionary<TemplateVertexKey, int> registry, TemplateVertexKey key,
+                Mesh sculpted_mesh, double x_dist, double y_dist)
+            {
+                if (registry.TryGetValue(key, out int idx))
+                    return idx;
+
+                Point3d pos = ResolveTemplateVertexKey(key, sculpted_mesh, x_dist, y_dist);
+                int new_idx = sculpted_mesh.Vertices.Add(pos);
+                registry[key] = new_idx;
+                return new_idx;
+            }
+
+            // AxisHalf points sit at the midpoint between two background
+            // vertices (the cell's outward edge midpoint), so unlike
+            // CornerThird -- which is always exactly 1/3 of a specific
+            // cell from a specific corner, reachable no other way -- the
+            // SAME physical point can be requested as AxisHalf(a,dir) from
+            // one side or AxisHalf(b,-dir) from the other. Two straight
+            // connectors anchored at adjacent-but-not-bridge-connected
+            // background vertices could otherwise each add their own
+            // coincident copy of that point. This resolves the anchor to
+            // whichever of {v, its actual background neighbor in that
+            // direction} has the lower index, so both sides of the same
+            // physical point always agree on the same key.
+            public static int GetOrAddAxisHalfVertex(Dictionary<TemplateVertexKey, int> registry, Mesh background,
+                int v, int dx, int dy, Mesh sculpted_mesh, double x_dist, double y_dist)
+            {
+                Point3d v_pos = background.Vertices[v];
+                Point3d target = new Point3d(v_pos.X + dx * x_dist, v_pos.Y + dy * y_dist, v_pos.Z);
+
+                // v is a raw mesh-vertex index; ConnectedTopologyVertices
+                // needs a topology index, and returns topology indices back
+                // -- converted explicitly both directions via RhinoCommon's
+                // own mapping rather than assuming raw == topology (true
+                // for a freshly-built CreateFromPlane grid with no
+                // coincident vertices, but not guaranteed in general).
+                int neighbor = -1;
+                int v_topo = background.TopologyVertices.TopologyVertexIndex(v);
+                foreach (int candidate_topo in background.TopologyVertices.ConnectedTopologyVertices(v_topo))
+                {
+                    int[] candidate_raw = background.TopologyVertices.MeshVertexIndices(candidate_topo);
+                    if (candidate_raw.Length == 0)
+                        continue;
+
+                    if (((Point3d)background.Vertices[candidate_raw[0]]).DistanceToSquared(target) < 1e-8)
                     {
-                        x_dist = vertex.X - background.Vertices[0].X;
-                    }
-                    else if ((vertex.Y - background.Vertices[0].Y) > 1e-5)
-                    {
-                        y_dist = vertex.Y - background.Vertices[0].Y;
+                        neighbor = candidate_raw[0];
                         break;
                     }
                 }
 
-                // Mesh edges with Trapazoids
-                //Mesh trapazoids = new Mesh();
-                for(int i = 0; i < path.Count - 1; i++)
-                {
-                    int v1 = path[i];
-                    int v2 = path[i + 1];
-                    MeshEdge(sculpted_mesh, background, v1, v2, x_dist, y_dist, location_to_index);
-                }
+                TemplateVertexKey key = (neighbor >= 0 && neighbor < v)
+                    ? new TemplateVertexKey(TemplateVertexKind.AxisHalf, neighbor, -dx, -dy)
+                    : new TemplateVertexKey(TemplateVertexKind.AxisHalf, v, dx, dy);
 
-                int[] start_faces = background.TopologyVertices.ConnectedFaces(path[0]);
-                int[] end_faces = background.TopologyVertices.ConnectedFaces(path.Last());
-
-                foreach(int face in start_faces)
-                {
-                    if (faces_to_keep.Contains(face))
-                    {
-                        MeshComponentFace(sculpted_mesh, background, background.Faces[face],
-                            path[0], path[1], x_dist, y_dist, location_to_index);
-                    }
-                }
-                foreach(int face in end_faces)
-                {
-                    if(faces_to_keep.Contains(face))
-                    {
-                        MeshComponentFace(sculpted_mesh, background, background.Faces[face], 
-                            path[path.Count - 1], path[path.Count - 2], x_dist, y_dist, location_to_index);
-                    }
-                }
-
-                for (int i = 0; i < sculpted_mesh.TopologyVertices.Count; i++)
-                {
-                    int[] connected_faces = sculpted_mesh.TopologyVertices.ConnectedFaces(i);
-                    int[] connected_edges = sculpted_mesh.TopologyVertices.ConnectedEdges(i);
-                    int[] connected_vertices = sculpted_mesh.TopologyVertices.ConnectedTopologyVertices(i);
-
-                    if (connected_faces.Length == 4 && connected_edges.Length == 6)
-                    {
-                        int x_counter = 0;
-                        int y_counter = 0;
-                        Point3d current_vertex = sculpted_mesh.TopologyVertices[i];
-                        List<int> v_idxs = new List<int>();
-                        foreach (var v in connected_vertices)
-                        {
-                            Point3d vertex = sculpted_mesh.TopologyVertices[v];
-                            double distance = vertex.DistanceTo(current_vertex);
-
-                            if (Math.Abs(distance - x_dist) < 1e-5)
-                            {
-                                x_counter++;
-                                v_idxs.Add(v);
-                            }
-                            else if (Math.Abs(distance - y_dist) < 1e-5)
-                            {
-                                y_counter++;
-                                v_idxs.Add(v);
-                            }
-                        }
-
-                        if (x_counter == 2 && y_counter == 0)
-                        {
-                            MeshPinchVertexX(sculpted_mesh, i, x_dist, y_dist, location_to_index);
-                        }
-                        else if (y_counter == 2 && x_counter == 0)
-                        {
-                            MeshPinchVertexY(sculpted_mesh, i, x_dist, y_dist, location_to_index);
-                        }
-                    }
-                }
-
-                //sculpted_mesh.Append(trapazoids);
-
-                //return trapazoids;
+                return GetOrAddTemplateVertex(registry, key, sculpted_mesh, x_dist, y_dist);
             }
 
-            public static void MeshEdge(Mesh sculpted_mesh, Mesh background, int v1, 
-                int v2, double x_dist, double y_dist, Dictionary<Point3d, int> l_to_i)
+            // Centralizes face creation so every template goes through the
+            // same duplicate/degeneracy checks: a repeated path (or a
+            // duplicate bridge edge, before dedup) can no longer stack
+            // identical or degenerate faces. Canonical key is the four
+            // vertex indices sorted ascending, which identifies the same
+            // quad regardless of winding/rotation for duplicate detection.
+            public static bool TryAddTemplateQuad(Mesh sculpted_mesh, HashSet<Tuple<int, int, int, int>> generated_faces,
+                int a, int b, int c, int d)
             {
-                Point3d point0 = new Point3d();
-                Point3d point1 = new Point3d();
-                Point3d point2 = new Point3d();
-                Point3d point3 = new Point3d();
-                Point3d point4 = new Point3d();
-                Point3d point5 = new Point3d();
+                if (a == b || a == c || a == d || b == c || b == d || c == d)
+                    return false;
 
-                if (v1 < v2)
-                {
-                    point0 = background.Vertices[v1];
-                    point1 = background.Vertices[v2];
-                }
-                else
-                {
-                    point0 = background.Vertices[v2];
-                    point1 = background.Vertices[v1];
-                }
-                Vector3d vector = point1 - point0;
+                int[] idxs = new int[] { a, b, c, d };
 
-                if (Math.Abs(vector.Y) < 1e-5)
+                // Reject near-zero-area quads before insertion (not just
+                // diagnosing them afterward): shoelace formula on the flat
+                // XY projection, tolerance scaled to the quad's own point
+                // spread so this doesn't depend on absolute grid units.
+                Point3d[] pts = new Point3d[4];
+                double max_dist_sq = 0;
+                for (int i = 0; i < 4; i++)
                 {
-                    point2 = new Point3d(point0.X + x_dist / 3, point0.Y + y_dist / 3, point0.Z);
-                    point3 = new Point3d(point2.X + x_dist / 3, point2.Y, point2.Z);
-                    point4 = new Point3d(point0.X + x_dist / 3, point0.Y - y_dist / 3, point0.Z);
-                    point5 = new Point3d(point4.X + x_dist / 3, point4.Y, point4.Z);
-                }
-                else if (Math.Abs(vector.X) < 1e-5)
-                {
-                    point2 = new Point3d(point0.X - x_dist / 3, point0.Y + y_dist / 3, point0.Z);
-                    point3 = new Point3d(point2.X, point2.Y + y_dist / 3, point2.Z);
-                    point4 = new Point3d(point0.X + x_dist / 3, point0.Y + y_dist / 3, point0.Z);
-                    point5 = new Point3d(point4.X, point4.Y + y_dist / 3, point4.Z);
-                }
-
-                List<Point3d> vertices = new List<Point3d> { point0, point1, point2, point3, point4, point5 };
-                List<int> idxs = new List<int>();
-                foreach(var vert in vertices)
-                {
-                    if(l_to_i.ContainsKey(RoundPoint(vert)))
+                    pts[i] = sculpted_mesh.Vertices[idxs[i]];
+                    for (int j = 0; j < i; j++)
                     {
-                        idxs.Add(l_to_i[RoundPoint(vert)]);
+                        double dsq = pts[i].DistanceToSquared(pts[j]);
+                        if (dsq > max_dist_sq)
+                            max_dist_sq = dsq;
                     }
+                }
+
+                double signed_area2 = 0;
+                for (int i = 0; i < 4; i++)
+                {
+                    Point3d cur = pts[i];
+                    Point3d next = pts[(i + 1) % 4];
+                    signed_area2 += cur.X * next.Y - next.X * cur.Y;
+                }
+                if (Math.Abs(signed_area2) * 0.5 < 1e-6 * max_dist_sq)
+                    return false;
+
+                int[] sorted = (int[])idxs.Clone();
+                Array.Sort(sorted);
+                Tuple<int, int, int, int> key = new Tuple<int, int, int, int>(sorted[0], sorted[1], sorted[2], sorted[3]);
+                if (!generated_faces.Add(key))
+                    return false;
+
+                sculpted_mesh.Faces.AddFace(a, b, c, d);
+                return true;
+            }
+
+            // Replaces the old per-path ConnectByVertexPath. Consolidates
+            // every accepted path (across every component pair) into one
+            // canonical set of unique bridge edges before meshing anything,
+            // so a duplicate or repeatedly-cached path can no longer stack
+            // duplicate trapezoids. Straight-vs-turn classification is done
+            // from signed background-grid directions between a bridge
+            // vertex's actual neighbors in this consolidated graph, not
+            // from scalar distance -- immune to x_dist == y_dist (square
+            // cells), which the old post-hoc topology scan was not.
+            public static void ConnectBridgeGraph(Mesh background, Mesh sculpted_mesh, List<int> faces_to_keep,
+                List<List<int>> all_paths, double x_dist, double y_dist, List<string> diagnostics)
+            {
+                HashSet<Tuple<int, int>> bridge_edges = new HashSet<Tuple<int, int>>();
+                foreach (var path in all_paths)
+                {
+                    for (int k = 0; k < path.Count - 1; k++)
+                    {
+                        int a = path[k];
+                        int b = path[k + 1];
+                        bridge_edges.Add(new Tuple<int, int>(Math.Min(a, b), Math.Max(a, b)));
+                    }
+                }
+
+                Dictionary<int, HashSet<int>> bridge_neighbors = new Dictionary<int, HashSet<int>>();
+                foreach (var edge in bridge_edges)
+                {
+                    if (!bridge_neighbors.ContainsKey(edge.Item1))
+                        bridge_neighbors[edge.Item1] = new HashSet<int>();
+                    if (!bridge_neighbors.ContainsKey(edge.Item2))
+                        bridge_neighbors[edge.Item2] = new HashSet<int>();
+
+                    bridge_neighbors[edge.Item1].Add(edge.Item2);
+                    bridge_neighbors[edge.Item2].Add(edge.Item1);
+                }
+
+                // Classify BEFORE meshing anything: find every vertex that's
+                // part of a branch (degree >= 3), then flood-fill through
+                // the bridge graph to find the whole connected subgraph
+                // each one belongs to, and exclude every edge in those
+                // subgraphs from meshing entirely. Doing this first means a
+                // branch can never leave partially-connected trapezoids
+                // behind -- either a whole bridge subgraph is safe and gets
+                // meshed, or it's excluded and gets none of its geometry
+                // published, never a mix of the two.
+                HashSet<int> excluded_vertices = new HashSet<int>();
+                int junction_vertex_count = 0;
+                foreach (var kvp in bridge_neighbors)
+                {
+                    if (kvp.Value.Count >= 3)
+                    {
+                        junction_vertex_count++;
+                        if (excluded_vertices.Contains(kvp.Key))
+                            continue;
+
+                        Queue<int> flood = new Queue<int>();
+                        flood.Enqueue(kvp.Key);
+                        excluded_vertices.Add(kvp.Key);
+                        while (flood.Count > 0)
+                        {
+                            int cur = flood.Dequeue();
+                            foreach (int nbr in bridge_neighbors[cur])
+                            {
+                                if (excluded_vertices.Add(nbr))
+                                    flood.Enqueue(nbr);
+                            }
+                        }
+                    }
+                }
+
+                int excluded_edge_count = 0;
+                HashSet<Tuple<int, int>> safe_edges = new HashSet<Tuple<int, int>>();
+                foreach (var edge in bridge_edges)
+                {
+                    if (excluded_vertices.Contains(edge.Item1) || excluded_vertices.Contains(edge.Item2))
+                        excluded_edge_count++;
                     else
-                    {
-                        int idx = sculpted_mesh.Vertices.Add(vert);
-                        idxs.Add(idx);
-                        l_to_i.Add(RoundPoint(vert), idx);
-                    }
+                        safe_edges.Add(edge);
                 }
 
-                //Mesh mesh1 = new Mesh();
-                //mesh1.Vertices.AddVertices(vertices);
-                //mesh1.Faces.AddFace(0, 1, 3, 2);
-                //mesh1.Faces.AddFace(0, 4, 5, 1);
+                if (excluded_vertices.Count > 0)
+                {
+                    diagnostics?.Add($"WARNING: {junction_vertex_count:N0} branch junction vertices (degree >= 3, "
+                        + $"no template defined) found; excluding their {excluded_vertices.Count:N0}-vertex connected "
+                        + $"subgraph(s) entirely, removing {excluded_edge_count:N0} incident bridge edges from meshing");
+                }
 
-                //trapazoids.Append(mesh1);
-                //trapazoids.Compact();
+                Dictionary<TemplateVertexKey, int> registry = new Dictionary<TemplateVertexKey, int>();
+                for (int i = 0; i < background.Vertices.Count; i++)
+                    registry[new TemplateVertexKey(TemplateVertexKind.Background, i, 0, 0)] = i;
 
-                sculpted_mesh.Faces.AddFace(idxs[0], idxs[1], idxs[3], idxs[2]);
-                sculpted_mesh.Faces.AddFace(idxs[0], idxs[4], idxs[5], idxs[1]);
+                HashSet<Tuple<int, int, int, int>> generated_faces = new HashSet<Tuple<int, int, int, int>>();
+
+                foreach (var edge in safe_edges)
+                    AddBridgeEdgeTemplate(sculpted_mesh, edge.Item1, edge.Item2, x_dist, y_dist, registry, generated_faces);
+
+                int endpoints = 0, straight_connectors = 0, turns = 0, unclassified = 0;
+
+                foreach (var kvp in bridge_neighbors)
+                {
+                    int v = kvp.Key;
+                    if (excluded_vertices.Contains(v))
+                        continue;
+
+                    List<int> neighbors = kvp.Value.ToList();
+
+                    if (neighbors.Count == 1)
+                    {
+                        int bridge_neighbor = neighbors[0];
+                        int v_topo = background.TopologyVertices.TopologyVertexIndex(v);
+                        int[] connected_faces = background.TopologyVertices.ConnectedFaces(v_topo);
+                        foreach (int face in connected_faces)
+                        {
+                            if (faces_to_keep.Contains(face))
+                            {
+                                MeshComponentFace(sculpted_mesh, background, background.Faces[face],
+                                    v, bridge_neighbor, x_dist, y_dist, registry, generated_faces);
+                            }
+                        }
+                        endpoints++;
+                    }
+                    else if (neighbors.Count == 2)
+                    {
+                        int a = neighbors[0];
+                        int b = neighbors[1];
+                        Point3d pv = sculpted_mesh.Vertices[v];
+                        Vector3d va = (Point3d)sculpted_mesh.Vertices[a] - pv;
+                        Vector3d vb = (Point3d)sculpted_mesh.Vertices[b] - pv;
+
+                        bool a_horiz = Math.Abs(va.Y) < 1e-5;
+                        bool a_vert = Math.Abs(va.X) < 1e-5;
+                        bool b_horiz = Math.Abs(vb.Y) < 1e-5;
+                        bool b_vert = Math.Abs(vb.X) < 1e-5;
+
+                        if (a_horiz && b_horiz && va.X * vb.X < 0)
+                        {
+                            MeshPinchVertexX(sculpted_mesh, background, v, x_dist, y_dist, registry, generated_faces);
+                            straight_connectors++;
+                        }
+                        else if (a_vert && b_vert && va.Y * vb.Y < 0)
+                        {
+                            MeshPinchVertexY(sculpted_mesh, background, v, x_dist, y_dist, registry, generated_faces);
+                            straight_connectors++;
+                        }
+                        else if ((a_horiz && b_vert) || (a_vert && b_horiz))
+                        {
+                            // 90-degree turn: the two edge templates already
+                            // share their inside corner via the registry
+                            // (same TemplateVertexKey resolved from both
+                            // sides) -- no straight connector belongs here.
+                            turns++;
+                        }
+                        else
+                        {
+                            unclassified++;
+                            diagnostics?.Add($"WARNING: bridge vertex {v} (background) has an unexpected "
+                                + $"degree-2 neighbor direction pair ({a},{b}); no connector added");
+                        }
+                    }
+                    // NOTE: no `else` branch for neighbors.Count >= 3 here --
+                    // every true junction vertex (degree >= 3) was already
+                    // added to excluded_vertices above and skipped by the
+                    // `continue` at the top of this loop, so this branch of
+                    // the classification could never actually run. Reported
+                    // via junction_vertex_count/excluded_vertices instead,
+                    // before any meshing happened, which is the accurate
+                    // place to count and report it.
+                }
+
+                diagnostics?.Add($"bridge graph: {bridge_edges.Count:N0} unique edges, {bridge_neighbors.Count:N0} vertices, "
+                    + $"{endpoints:N0} endpoints, {straight_connectors:N0} straight connectors, {turns:N0} turns, "
+                    + $"{junction_vertex_count:N0} branch junction vertices, {excluded_vertices.Count:N0} vertices excluded "
+                    + $"(branch subgraphs), {unclassified:N0} unclassified");
             }
 
-            public static void MeshComponentFace(Mesh sculpted_mesh, Mesh background, 
-                MeshFace face, int v_face, int v, double x_dist, double y_dist, Dictionary<Point3d, int> l_to_i)
+            // Replaces the old MeshEdge. Orientation is now derived from
+            // actual geometric direction (which endpoint is west/east or
+            // south/north), not from which raw vertex index happens to be
+            // smaller -- the old convention had no relationship to
+            // geometric position, so this produces the same trapezoids
+            // regardless of whether the caller passes (a,b) or (b,a).
+            public static void AddBridgeEdgeTemplate(Mesh sculpted_mesh, int a, int b, double x_dist, double y_dist,
+                Dictionary<TemplateVertexKey, int> registry, HashSet<Tuple<int, int, int, int>> generated_faces)
             {
-                Vector3d vector = background.Vertices[v_face] - background.Vertices[v];
+                Point3d pa = sculpted_mesh.Vertices[a];
+                Point3d pb = sculpted_mesh.Vertices[b];
+                Vector3d vec = pb - pa;
 
-                Point3d point0 = new Point3d();
-                Point3d point1 = new Point3d();
-                Point3d point2 = new Point3d();
-                Point3d point3 = new Point3d();
+                if (Math.Abs(vec.Y) < 1e-5)
+                {
+                    int west = pa.X < pb.X ? a : b;
+                    int east = pa.X < pb.X ? b : a;
+
+                    int nwW = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, west, +1, +1), sculpted_mesh, x_dist, y_dist);
+                    int nwE = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, east, -1, +1), sculpted_mesh, x_dist, y_dist);
+                    int swW = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, west, +1, -1), sculpted_mesh, x_dist, y_dist);
+                    int swE = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, east, -1, -1), sculpted_mesh, x_dist, y_dist);
+
+                    TryAddTemplateQuad(sculpted_mesh, generated_faces, west, east, nwE, nwW);
+                    TryAddTemplateQuad(sculpted_mesh, generated_faces, west, swW, swE, east);
+                }
+                else if (Math.Abs(vec.X) < 1e-5)
+                {
+                    int south = pa.Y < pb.Y ? a : b;
+                    int north = pa.Y < pb.Y ? b : a;
+
+                    int swS = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, south, -1, +1), sculpted_mesh, x_dist, y_dist);
+                    int swN = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, north, -1, -1), sculpted_mesh, x_dist, y_dist);
+                    int seS = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, south, +1, +1), sculpted_mesh, x_dist, y_dist);
+                    int seN = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, north, +1, -1), sculpted_mesh, x_dist, y_dist);
+
+                    TryAddTemplateQuad(sculpted_mesh, generated_faces, south, north, swN, swS);
+                    TryAddTemplateQuad(sculpted_mesh, generated_faces, south, seS, seN, north);
+                }
+            }
+
+            // Closes off a bridge path's endpoint against one of its
+            // adjacent retained background faces. `endpoint` must be the
+            // vertex that actually belongs to `face` (this is what the
+            // face.A==endpoint style checks below test); `bridge_neighbor`
+            // is the endpoint's one bridge-graph neighbor, used only to
+            // determine whether the relevant edge of `face` is horizontal
+            // or vertical -- its sign doesn't otherwise matter, since which
+            // corner of `face` matches `endpoint` already fixes which side
+            // is "outward" (away from the retained face).
+            //
+            // Corner-third offsets for each of the four cases were
+            // hand-verified against the original point0..point3
+            // construction (each case checked independently -- the
+            // relationship between the two offsets is NOT the same across
+            // all four cases, so this intentionally doesn't try to share
+            // one formula across them).
+            public static void MeshComponentFace(Mesh sculpted_mesh, Mesh background,
+                MeshFace face, int endpoint, int bridge_neighbor, double x_dist, double y_dist,
+                Dictionary<TemplateVertexKey, int> registry, HashSet<Tuple<int, int, int, int>> generated_faces)
+            {
+                Vector3d vector = background.Vertices[endpoint] - background.Vertices[bridge_neighbor];
+
+                int p0, p1, dx2, dy2, dx3, dy3;
 
                 if (Math.Abs(vector.X) < 1e-5)
                 {
-                    if (face.A == v_face || face.B == v_face)
+                    if (face.A == endpoint || face.B == endpoint)
                     {
-                        point0 = background.Vertices[face.A];
-                        point1 = background.Vertices[face.B];
-                        point2 = new Point3d(point0.X + x_dist / 3, point0.Y - y_dist / 3, point0.Z);
-                        point3 = new Point3d(point2.X + x_dist / 3, point2.Y, point2.Z);
+                        p0 = face.A; p1 = face.B;
+                        dx2 = +1; dy2 = -1; dx3 = -1; dy3 = -1;
                     }
-                    else if (face.C == v_face || face.D == v_face)
+                    else if (face.C == endpoint || face.D == endpoint)
                     {
-                        point0 = background.Vertices[face.C];
-                        point1 = background.Vertices[face.D];
-                        point2 = new Point3d(point0.X - x_dist / 3, point0.Y + y_dist / 3, point0.Z);
-                        point3 = new Point3d(point2.X - x_dist / 3, point2.Y, point2.Z);
+                        p0 = face.C; p1 = face.D;
+                        dx2 = -1; dy2 = +1; dx3 = +1; dy3 = +1;
                     }
                     else
-                        throw new Exception("The face vertex ({0}) does not belong to the face");
+                        throw new Exception($"MeshComponentFace: endpoint {endpoint} does not belong to the given face");
                 }
                 else if (Math.Abs(vector.Y) < 1e-5)
                 {
-                    if (face.A == v_face || face.D == v_face)
+                    if (face.A == endpoint || face.D == endpoint)
                     {
-                        point0 = background.Vertices[face.D];
-                        point1 = background.Vertices[face.A];
-                        point2 = new Point3d(point0.X - x_dist / 3, point0.Y - y_dist / 3, point0.Z);
-                        point3 = new Point3d(point2.X, point2.Y - y_dist / 3, point2.Z);
+                        p0 = face.D; p1 = face.A;
+                        dx2 = -1; dy2 = -1; dx3 = -1; dy3 = +1;
                     }
-                    else if (face.B == v_face || face.C == v_face)
+                    else if (face.B == endpoint || face.C == endpoint)
                     {
-                        point0 = background.Vertices[face.B];
-                        point1 = background.Vertices[face.C];
-                        point2 = new Point3d(point0.X + x_dist / 3, point0.Y + y_dist / 3, point0.Z);
-                        point3 = new Point3d(point2.X, point2.Y + y_dist / 3, point2.Z);
+                        p0 = face.B; p1 = face.C;
+                        dx2 = +1; dy2 = +1; dx3 = +1; dy3 = -1;
                     }
                     else
-                        throw new Exception("The face vertex ({0}) does not belong to the face");
+                        throw new Exception($"MeshComponentFace: endpoint {endpoint} does not belong to the given face");
                 }
-
-                List<Point3d> vertices = new List<Point3d> { point0, point1, point2, point3 };
-                List<int> idxs = new List<int>();
-                foreach (var vert in vertices)
+                else
                 {
-                    if (l_to_i.ContainsKey(RoundPoint(vert)))
-                    {
-                        idxs.Add(l_to_i[RoundPoint(vert)]);
-                    }
-                    else
-                    {
-                        int idx = sculpted_mesh.Vertices.Add(vert);
-                        idxs.Add(idx);
-                        l_to_i.Add(RoundPoint(vert), idx);
-                    }
+                    throw new Exception("MeshComponentFace: endpoint/bridge-neighbor direction is neither axis-aligned");
                 }
 
-                //Mesh mesh1 = new Mesh();
-                //mesh1.Vertices.AddVertices(vertices);
-                //mesh1.Faces.AddFace(0, 2, 3, 1);
+                int idx2 = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, p0, dx2, dy2), sculpted_mesh, x_dist, y_dist);
+                int idx3 = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, p1, dx3, dy3), sculpted_mesh, x_dist, y_dist);
 
-                //trapazoids.Append(mesh1);
-                //trapazoids.Compact();
-
-                sculpted_mesh.Faces.AddFace(idxs[0], idxs[2], idxs[3], idxs[1]);
+                TryAddTemplateQuad(sculpted_mesh, generated_faces, p0, idx2, idx3, p1);
             }
 
-            public static void MeshPinchVertexX(Mesh sculpted_mesh, int v, double x_dist, double y_dist, Dictionary<Point3d, int> l_to_i)
+            // Straight-horizontal connector. Reached only when both bridge
+            // neighbors are horizontal from v and point in opposite X
+            // directions (see ConnectBridgeGraph) -- never reached for a
+            // vertical join or a turn, regardless of whether x_dist and
+            // y_dist happen to be equal, since that classification no
+            // longer depends on scalar distance at all.
+            public static void MeshPinchVertexX(Mesh sculpted_mesh, Mesh background, int v, double x_dist, double y_dist,
+                Dictionary<TemplateVertexKey, int> registry, HashSet<Tuple<int, int, int, int>> generated_faces)
             {
-                Point3d point0 = sculpted_mesh.Vertices[v];
-                Point3d point1 = new Point3d(point0.X - x_dist / 3, point0.Y + y_dist / 3, point0.Z);
-                Point3d point2 = new Point3d(point0.X, point0.Y + y_dist / 2, point0.Z);
-                Point3d point3 = new Point3d(point1.X + 2 * x_dist / 3, point1.Y, point1.Z);
-                Point3d point4 = new Point3d(point0.X - x_dist / 3, point0.Y - y_dist / 3, point0.Z);
-                Point3d point5 = new Point3d(point0.X, point0.Y - y_dist / 2, point0.Z);
-                Point3d point6 = new Point3d(point4.X + 2 * x_dist / 3, point4.Y, point4.Z);
-                
-                List<Point3d> vertices = new List<Point3d> 
-                { point0, point1, point2, point3, point4, point5, point6 };
-                List<int> idxs = new List<int>();
-                foreach (var vert in vertices)
-                {
-                    if (l_to_i.ContainsKey(RoundPoint(vert)))
-                    {
-                        idxs.Add(l_to_i[RoundPoint(vert)]);
-                    }
-                    else
-                    {
-                        int idx = sculpted_mesh.Vertices.Add(vert);
-                        idxs.Add(idx);
-                        l_to_i.Add(RoundPoint(vert), idx);
-                    }
-                }
+                int nw = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, v, -1, +1), sculpted_mesh, x_dist, y_dist);
+                int n = GetOrAddAxisHalfVertex(registry, background, v, 0, +1, sculpted_mesh, x_dist, y_dist);
+                int ne = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, v, +1, +1), sculpted_mesh, x_dist, y_dist);
+                int sw = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, v, -1, -1), sculpted_mesh, x_dist, y_dist);
+                int s = GetOrAddAxisHalfVertex(registry, background, v, 0, -1, sculpted_mesh, x_dist, y_dist);
+                int se = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, v, +1, -1), sculpted_mesh, x_dist, y_dist);
 
-                //Mesh mesh = new Mesh();
-                //mesh.Vertices.AddVertices(points);
-                //mesh.Faces.AddFace(0, 3, 2, 1);
-                //mesh.Faces.AddFace(0, 4, 5, 6);
-
-                //trapazoids.Append(mesh);
-                //trapazoids.Compact();
-
-                sculpted_mesh.Faces.AddFace(idxs[0], idxs[3], idxs[2], idxs[1]);
-                sculpted_mesh.Faces.AddFace(idxs[0], idxs[4], idxs[5], idxs[6]);
+                TryAddTemplateQuad(sculpted_mesh, generated_faces, v, ne, n, nw);
+                TryAddTemplateQuad(sculpted_mesh, generated_faces, v, sw, s, se);
             }
 
-            public static void MeshPinchVertexY(Mesh sculpted_mesh, int v, double x_dist, double y_dist, Dictionary<Point3d, int> l_to_i)
+            // Straight-vertical connector -- the 90-degree rotation of
+            // MeshPinchVertexX. This is what a vertical straight join
+            // should always have received; on a square (or near-square)
+            // grid the old scalar-distance classifier could send it to
+            // MeshPinchVertexX instead, overlaying this component's own
+            // trapezoids.
+            public static void MeshPinchVertexY(Mesh sculpted_mesh, Mesh background, int v, double x_dist, double y_dist,
+                Dictionary<TemplateVertexKey, int> registry, HashSet<Tuple<int, int, int, int>> generated_faces)
             {
-                Point3d point0 = sculpted_mesh.Vertices[v];
-                Point3d point1 = new Point3d(point0.X - x_dist / 3, point0.Y - y_dist / 3, point0.Z);
-                Point3d point2 = new Point3d(point0.X - x_dist / 2, point0.Y, point0.Z);
-                Point3d point3 = new Point3d(point1.X, point1.Y + 2 * y_dist / 3, point1.Z);
-                Point3d point4 = new Point3d(point0.X + x_dist / 3, point0.Y - y_dist / 3, point0.Z);
-                Point3d point5 = new Point3d(point0.X + x_dist / 2, point0.Y, point0.Z);
-                Point3d point6 = new Point3d(point4.X, point4.Y + 2 * y_dist / 3, point4.Z);
-                
-                List<Point3d> vertices = new List<Point3d>
-                { point0, point1, point2, point3, point4, point5, point6 };
-                List<int> idxs = new List<int>();
-                foreach (var vert in vertices)
-                {
-                    if (l_to_i.ContainsKey(RoundPoint(vert)))
-                    {
-                        idxs.Add(l_to_i[RoundPoint(vert)]);
-                    }
-                    else
-                    {
-                        int idx = sculpted_mesh.Vertices.Add(vert);
-                        idxs.Add(idx);
-                        l_to_i.Add(RoundPoint(vert), idx);
-                    }
-                }
+                int sw = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, v, -1, -1), sculpted_mesh, x_dist, y_dist);
+                int w = GetOrAddAxisHalfVertex(registry, background, v, -1, 0, sculpted_mesh, x_dist, y_dist);
+                int nw = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, v, -1, +1), sculpted_mesh, x_dist, y_dist);
+                int se = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, v, +1, -1), sculpted_mesh, x_dist, y_dist);
+                int e = GetOrAddAxisHalfVertex(registry, background, v, +1, 0, sculpted_mesh, x_dist, y_dist);
+                int ne = GetOrAddTemplateVertex(registry, new TemplateVertexKey(TemplateVertexKind.CornerThird, v, +1, +1), sculpted_mesh, x_dist, y_dist);
 
-                //Mesh mesh = new Mesh();
-                //mesh.Vertices.AddVertices(points);
-                //mesh.Faces.AddFace(0, 3, 2, 1);
-                //mesh.Faces.AddFace(0, 4, 5, 6);
-
-                //trapazoids.Append(mesh);
-                //trapazoids.Compact();
-
-                sculpted_mesh.Faces.AddFace(idxs[0], idxs[3], idxs[2], idxs[1]);
-                sculpted_mesh.Faces.AddFace(idxs[0], idxs[4], idxs[5], idxs[6]);
+                TryAddTemplateQuad(sculpted_mesh, generated_faces, v, nw, w, sw);
+                TryAddTemplateQuad(sculpted_mesh, generated_faces, v, se, e, ne);
             }
 
             public static void ConnectPinch(Mesh mesh, int v, Dictionary<Point3d, int> l_to_i)
