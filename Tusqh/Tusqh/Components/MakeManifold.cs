@@ -93,16 +93,139 @@ namespace Sculpt2D.Components
             timings.Add($"01 inputs ({input_mesh.Vertices.Count:N0} verts, {init_face_count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
 
-            Dictionary<Point3d, int> location_to_index = new Dictionary<Point3d, int>();
-            for (int v = 0; v < input_mesh.Vertices.Count; v++)
+            // ConnectPinch/SeparatePinch's new vertices are keyed by exact
+            // grid-relative position (GetOrAddPinchVertex) instead of
+            // RoundPoint's fixed-decimal rounding. An already-existing
+            // vertex a call needs directly (a pinch's own neighbor corners)
+            // is looked up by topology/raw index, not through this registry
+            // -- but a *different* already-existing vertex (e.g. one
+            // AntiAliasing2D generated for its own bridge/connector
+            // templates, which sit on the same third-of-a-cell lattice
+            // pinch geometry uses) can still coincide with a position a
+            // pinch call is about to synthesize. Pre-seeding below is what
+            // makes that call reuse it instead of adding a duplicate,
+            // coincident vertex.
+            // Fit the regular-grid spacing from its complete extent and
+            // number of coordinate levels, rather than subtracting the first
+            // two Point3f vertices. A tiny quantization error in one local
+            // interval accumulates when a vertex hundreds of cells away is
+            // normalized by that interval; that made legitimate background
+            // vertices miss the third-lattice tolerance at fine resolutions.
+            // Using both endpoints distributes only the endpoint error over
+            // every interval and prevents that cumulative phase drift.
+            HashSet<double> background_x_levels = new HashSet<double>();
+            HashSet<double> background_y_levels = new HashSet<double>();
+            double grid_z = background.Vertices[background.Faces[0].A].Z;
+            foreach (Point3f p in background.Vertices)
             {
-                Point3d vert = input_mesh.Vertices[v];
-                Point3d rounded_vert = Functions.RoundPoint(vert);
-
-                location_to_index.Add(rounded_vert, v);
+                background_x_levels.Add(p.X);
+                background_y_levels.Add(p.Y);
             }
 
-            timings.Add($"02 location_to_index construction: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            if (background_x_levels.Count < 2 || background_y_levels.Count < 2)
+            {
+                AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
+                    "Background mesh must contain at least two distinct X and Y coordinate levels.");
+                return;
+            }
+
+            double min_x = background_x_levels.Min();
+            double max_x = background_x_levels.Max();
+            double min_y = background_y_levels.Min();
+            double max_y = background_y_levels.Max();
+            Point3d grid_origin = new Point3d(min_x, min_y, grid_z);
+            double x_dist = (max_x - min_x) / (background_x_levels.Count - 1);
+            double y_dist = (max_y - min_y) / (background_y_levels.Count - 1);
+            Dictionary<(long, long, long), int> pinch_registry = new Dictionary<(long, long, long), int>();
+
+            // Only a vertex that actually lands on the third-of-a-cell
+            // lattice (within float tolerance) is seedable -- AntiAliasing2D
+            // also places vertices at half-cell (AxisHalf) and other
+            // fractional positions that aren't reachable by any pinch
+            // formula, and forcing those onto the lattice key would risk
+            // merging two genuinely different points instead of preventing
+            // a duplicate.
+            // MeshVertexList stores Point3f values. After subtracting an
+            // arbitrary model-space origin and normalizing by a small cell
+            // size, ordinary float quantization can readily exceed 1e-6.
+            // 1e-3 safely accommodates that error for the supported grids
+            // while remaining hundreds of times smaller than the 0.5
+            // residual of an AxisHalf vertex.
+            const double pinch_lattice_tolerance = 1e-3;
+            List<string> pinch_seed_diagnostics = new List<string>();
+            int lattice_eligible_vertices = 0;
+            int lattice_skipped_vertices = 0;
+            int lattice_collisions = 0;
+            int background_vertices_expected = 0;
+            int background_vertices_seeded = 0;
+            double max_seeded_residual = 0.0;
+            double max_background_residual = 0.0;
+            for (int i = 0; i < input_mesh.Vertices.Count; i++)
+            {
+                Point3d pos = input_mesh.Vertices[i];
+                var lattice = Functions.ComputePinchLatticeCoordinates(pos, grid_origin, x_dist, y_dist);
+                double residual_x = Math.Abs(lattice.X - Math.Round(lattice.X));
+                double residual_y = Math.Abs(lattice.Y - Math.Round(lattice.Y));
+                double residual_z = Math.Abs(lattice.Z - Math.Round(lattice.Z));
+                double residual = Math.Max(residual_x, Math.Max(residual_y, residual_z));
+
+                bool is_background_vertex = has_provenance && bg_map[i] >= 0;
+                if (is_background_vertex)
+                {
+                    background_vertices_expected++;
+                    if (residual > max_background_residual)
+                        max_background_residual = residual;
+                }
+
+                if (residual > pinch_lattice_tolerance)
+                {
+                    lattice_skipped_vertices++;
+                    continue;
+                }
+
+                lattice_eligible_vertices++;
+                if (is_background_vertex)
+                    background_vertices_seeded++;
+                if (residual > max_seeded_residual)
+                    max_seeded_residual = residual;
+
+                var key = Functions.ComputePinchKey(pos, grid_origin, x_dist, y_dist);
+                if (pinch_registry.TryGetValue(key, out int existing))
+                {
+                    if (existing != i)
+                    {
+                        lattice_collisions++;
+                        pinch_seed_diagnostics.Add($"Pinch-lattice key collision: raw vertices {existing} and {i} "
+                            + "both resolve to the same third-cell position -- keeping the first.");
+                    }
+                }
+                else
+                {
+                    pinch_registry[key] = i;
+                }
+            }
+
+            timings.Add($"02 fitted grid spacing ({background_x_levels.Count:N0} X levels, "
+                + $"{background_y_levels.Count:N0} Y levels; x_dist={x_dist:G17}, y_dist={y_dist:G17}), "
+                + $"pinch registry pre-seeded ({pinch_registry.Count:N0} unique keys; "
+                + $"{lattice_eligible_vertices:N0} lattice-eligible, {lattice_skipped_vertices:N0} non-lattice skipped, "
+                + $"{lattice_collisions:N0} collisions, max seeded residual={max_seeded_residual:G6}"
+                + (has_provenance
+                    ? $", background coverage={background_vertices_seeded:N0}/{background_vertices_expected:N0}, "
+                        + $"max background residual={max_background_residual:G6}"
+                    : ", background coverage unavailable (no valid bg_map)")
+                + $", tolerance={pinch_lattice_tolerance:G6}): "
+                + $"{phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            foreach (string diag in pinch_seed_diagnostics)
+                timings.Add($"02b {diag}");
+            if (has_provenance && background_vertices_seeded != background_vertices_expected)
+            {
+                string warning = $"Pinch registry missed "
+                    + $"{background_vertices_expected - background_vertices_seeded:N0} background-derived vertices; "
+                    + "their normalized lattice residual exceeded the seeding tolerance.";
+                timings.Add($"02b WARNING: {warning}");
+                AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, warning);
+            }
             phase_timer.Restart();
 
             MeshTopologyVertexList vert_list = input_mesh.TopologyVertices;
@@ -410,7 +533,7 @@ namespace Sculpt2D.Components
                     foreach (int vert in set)
                     {
                         connect_pinch_timer.Start();
-                        Functions.ConnectPinch(output_mesh, input_mesh, vert, location_to_index);
+                        Functions.ConnectPinch(output_mesh, input_mesh, vert, pinch_registry, grid_origin, x_dist, y_dist);
                         connect_pinch_timer.Stop();
                         connect_pinch_calls++;
                     }
@@ -421,7 +544,7 @@ namespace Sculpt2D.Components
                     foreach (int vert in set)
                     {
                         separate_pinch_timer.Start();
-                        Functions.SeparatePinch(output_mesh, input_mesh, vert, remove_face_at, location_to_index);
+                        Functions.SeparatePinch(output_mesh, input_mesh, vert, remove_face_at, pinch_registry, grid_origin, x_dist, y_dist);
                         separate_pinch_timer.Stop();
                         separate_pinch_calls++;
                     }

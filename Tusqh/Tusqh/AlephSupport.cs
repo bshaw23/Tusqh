@@ -4347,7 +4347,68 @@ namespace Sculpt2D
                 TryAddTemplateQuad(sculpted_mesh, generated_faces, v, se, e, ne);
             }
 
-            public static void ConnectPinch(Mesh mesh, Mesh topology_source, int v, Dictionary<Point3d, int> l_to_i)
+            // Exact key for pinch-resolution vertices, replacing RoundPoint's
+            // fixed-decimal rounding. RoundPoint can disagree at its rounding
+            // boundary between two arithmetically different paths to the
+            // same physical point -- the same floating-point-ambiguity
+            // problem the TemplateVertexKey system above (anchor + integer
+            // direction code) was built to eliminate for template geometry.
+            // Snapping to the grid's own exact unit (a third of a cell)
+            // instead of an absolute decimal count is scale-independent and
+            // immune to that boundary disagreement: two arithmetically
+            // different paths to the same physical point land well within
+            // floating-point noise of the same grid-third, not near a
+            // cutoff -- and unlike TemplateVertexKey, it needs no
+            // anchor/neighbor resolution, since the key is computed directly
+            // from the point's own position.
+            //
+            // Measured from grid_origin, not world zero: pos.X / (x_dist/3)
+            // alone is translation-sensitive. If the grid's own origin sits
+            // near the halfway point between two third-cell steps (ordinary
+            // for arbitrary Grasshopper geometry -- nothing guarantees a
+            // bounding box aligns to world zero), every legitimate lattice
+            // coordinate would land exactly on a rounding boundary, where
+            // Math.Round's round-to-even default sends two *different*
+            // adjacent lattice positions to the *same* integer. Measuring
+            // from grid_origin means a genuine lattice point always lands
+            // near an integer, never near that boundary. Z is scaled by the
+            // same x_dist-derived unit rather than a fixed decimal count,
+            // for the same scale-independence -- it's carried through
+            // verbatim by every caller (never new arithmetic), so this only
+            // needs to detect "did Z change," not resolve a Z-axis lattice.
+            public static (double X, double Y, double Z) ComputePinchLatticeCoordinates(
+                Point3d pos, Point3d grid_origin, double x_dist, double y_dist)
+            {
+                return (
+                    (pos.X - grid_origin.X) / (x_dist / 3.0),
+                    (pos.Y - grid_origin.Y) / (y_dist / 3.0),
+                    (pos.Z - grid_origin.Z) / (x_dist / 3.0));
+            }
+
+            public static (long, long, long) ComputePinchKey(Point3d pos, Point3d grid_origin, double x_dist, double y_dist)
+            {
+                var lattice = ComputePinchLatticeCoordinates(pos, grid_origin, x_dist, y_dist);
+                return (
+                    (long)Math.Round(lattice.X),
+                    (long)Math.Round(lattice.Y),
+                    (long)Math.Round(lattice.Z));
+            }
+
+            public static int GetOrAddPinchVertex(Mesh mesh, Dictionary<(long, long, long), int> registry,
+                Point3d pos, Point3d grid_origin, double x_dist, double y_dist)
+            {
+                var key = ComputePinchKey(pos, grid_origin, x_dist, y_dist);
+
+                if (registry.TryGetValue(key, out int idx))
+                    return idx;
+
+                int new_idx = mesh.Vertices.Add(pos);
+                registry[key] = new_idx;
+                return new_idx;
+            }
+
+            public static void ConnectPinch(Mesh mesh, Mesh topology_source, int v,
+                Dictionary<(long, long, long), int> pinch_registry, Point3d grid_origin, double x_dist, double y_dist)
             {
                 // topology_source is read for all TopologyVertices/TopologyEdges
                 // lookups instead of mesh -- mesh gets mutated (AddFace/Vertices.Add)
@@ -4395,6 +4456,17 @@ namespace Sculpt2D
                 points.Add(edge3_vert2);
                 points.Add(edge4_vert2);
 
+                // points[0..3] and v are already-existing mesh vertices --
+                // resolved to their raw index directly via topology instead
+                // of round-tripping their (already known) positions through
+                // GetOrAddPinchVertex.
+                int Raw(int topo) => topology_source.TopologyVertices.MeshVertexIndices(topo)[0];
+                int raw0 = Raw(edge1[0]);
+                int raw1 = Raw(edge2[0]);
+                int raw2 = Raw(edge3[1]);
+                int raw3 = Raw(edge4[1]);
+                int rawV = Raw(v);
+
                 Point3d shared_point = vert_list[v];
 
                 List<Vector2d> vectors = new List<Vector2d>();
@@ -4409,16 +4481,13 @@ namespace Sculpt2D
                         vectors.Add(vector);
                 }
 
-                Point3d vert0 = new Point3d();
-                Point3d vert1 = new Point3d();
-                Point3d vert2 = new Point3d();
-                Point3d vert3 = new Point3d();
-                Point3d vert4 = new Point3d();
-                Point3d vert5 = new Point3d();
                 double x = shared_point.X;
                 double y = shared_point.Y;
+                double z = shared_point.Z;
                 double l1 = Math.Sqrt(Math.Pow(vectors[0].X, 2) + Math.Pow(vectors[0].Y, 2));
                 double l2 = Math.Sqrt(Math.Pow(vectors[1].X, 2) + Math.Pow(vectors[1].Y, 2));
+
+                int P(double px, double py) => GetOrAddPinchVertex(mesh, pinch_registry, new Point3d(px, py, z), grid_origin, x_dist, y_dist);
 
                 // add faces to remove pinch points
                 if (edge1_face[0] == edge2_face[0])
@@ -4426,122 +4495,55 @@ namespace Sculpt2D
                     //edge1_face == edge2_face and edge3_face = edge4_face
                     //edge1 corresponds to edge4
                     //create mesh on this side to make it nonmanifold
-                    vert0 = new Point3d((x - l2 / 3), (y + l1 / 3), shared_point.Z);
-                    vert1 = new Point3d((x - 2 * l2 / 3), (y + l1 / 3), shared_point.Z);
-                    vert2 = new Point3d((x - l2 / 3), (y + 2 * l1 / 3), shared_point.Z);
-                    vert3 = points[3];
-                    vert4 = points[1];
-                    vert5 = shared_point;
+                    int idx0 = P(x - l2 / 3, y + l1 / 3);
+                    int idx1 = P(x - 2 * l2 / 3, y + l1 / 3);
+                    int idx2 = P(x - l2 / 3, y + 2 * l1 / 3);
+                    int idx3 = raw3;
+                    int idx4 = raw1;
+                    int idx5 = rawV;
 
-                    List<Point3d> verts = new List<Point3d> { vert0, vert1, vert2, vert3, vert4, vert5 };
-                    List<int> idxs = new List<int>();
-                    foreach (Point3d vert in verts)
-                    {
-                        Point3d r_vert = RoundPoint(vert);
-                        if (l_to_i.ContainsKey(r_vert))
-                        {
-                            idxs.Add(l_to_i[r_vert]);
-                        }
-                        else
-                        {
-                            int idx = mesh.Vertices.Add(vert);
-                            idxs.Add(idx);
-                            l_to_i.Add(r_vert, idx);
-                        }
-                    }
-
-                    mesh.Faces.AddFace(idxs[0], idxs[1], idxs[4], idxs[5]);
-                    mesh.Faces.AddFace(idxs[0], idxs[5], idxs[3], idxs[2]);
+                    mesh.Faces.AddFace(idx0, idx1, idx4, idx5);
+                    mesh.Faces.AddFace(idx0, idx5, idx3, idx2);
 
                     //edge2 corresponds to edge3
                     //create mesh on other side to make it nonmanifold
-                    vert0 = new Point3d((x + l2 / 3), (y - l1 / 3), shared_point.Z);
-                    vert1 = new Point3d((x + 2 * l2 / 3), (y - l1 / 3), shared_point.Z);
-                    vert2 = new Point3d((x + l2 / 3), (y - 2 * l1 / 3), shared_point.Z);
-                    vert3 = points[0];
-                    vert4 = points[2];
+                    idx0 = P(x + l2 / 3, y - l1 / 3);
+                    idx1 = P(x + 2 * l2 / 3, y - l1 / 3);
+                    idx2 = P(x + l2 / 3, y - 2 * l1 / 3);
+                    idx3 = raw0;
+                    idx4 = raw2;
 
-                    verts = new List<Point3d> { vert0, vert1, vert2, vert3, vert4, vert5 };
-                    idxs = new List<int>();
-                    foreach (Point3d vert in verts)
-                    {
-                        Point3d r_vert = RoundPoint(vert);
-                        if (l_to_i.ContainsKey(r_vert))
-                        {
-                            idxs.Add(l_to_i[r_vert]);
-                        }
-                        else
-                        {
-                            int idx = mesh.Vertices.Add(vert);
-                            idxs.Add(idx);
-                            l_to_i.Add(r_vert, idx);
-                        }
-                    }
-
-                    mesh.Faces.AddFace(idxs[0], idxs[1], idxs[4], idxs[5]);
-                    mesh.Faces.AddFace(idxs[0], idxs[5], idxs[3], idxs[2]);
+                    mesh.Faces.AddFace(idx0, idx1, idx4, idx5);
+                    mesh.Faces.AddFace(idx0, idx5, idx3, idx2);
                 }
                 else if (edge1_face[0] == edge3_face[0])
                 {
                     //edge1_face == edge4_face and edge2_face == edge3_face
                     //edge1 corresponds to edge2
-                    vert0 = new Point3d((x + l2 / 3), (y + l1 / 3), shared_point.Z);
-                    vert1 = new Point3d((x + 2 * l2 / 3), (y + l1 / 3), shared_point.Z);
-                    vert2 = new Point3d((x + l2 / 3), (y + 2 * l1 / 3), shared_point.Z);
-                    vert3 = points[3];
-                    vert4 = points[2];
-                    vert5 = shared_point;
+                    int idx0 = P(x + l2 / 3, y + l1 / 3);
+                    int idx1 = P(x + 2 * l2 / 3, y + l1 / 3);
+                    int idx2 = P(x + l2 / 3, y + 2 * l1 / 3);
+                    int idx3 = raw3;
+                    int idx4 = raw2;
+                    int idx5 = rawV;
 
-                    List<Point3d> verts = new List<Point3d> { vert0, vert1, vert2, vert3, vert4, vert5 };
-                    List<int> idxs = new List<int>();
-                    foreach (Point3d vert in verts)
-                    {
-                        Point3d r_vert = RoundPoint(vert);
-                        if (l_to_i.ContainsKey(r_vert))
-                        {
-                            idxs.Add(l_to_i[r_vert]);
-                        }
-                        else
-                        {
-                            int idx = mesh.Vertices.Add(vert);
-                            idxs.Add(idx);
-                            l_to_i.Add(r_vert, idx);
-                        }
-                    }
-
-                    mesh.Faces.AddFace(idxs[0], idxs[5], idxs[4], idxs[1]);
-                    mesh.Faces.AddFace(idxs[0], idxs[2], idxs[3], idxs[5]);
+                    mesh.Faces.AddFace(idx0, idx5, idx4, idx1);
+                    mesh.Faces.AddFace(idx0, idx2, idx3, idx5);
 
                     //edge3 corresponds to edge4
-                    vert0 = new Point3d((x - l2 / 3), (y - l1 / 3), shared_point.Z);
-                    vert1 = new Point3d((x - 2 * l2 / 3), (y - l1 / 3), shared_point.Z);
-                    vert2 = new Point3d((x - l2 / 3), (y - 2 * l1 / 3), shared_point.Z);
-                    vert3 = points[0];
-                    vert4 = points[1];
+                    idx0 = P(x - l2 / 3, y - l1 / 3);
+                    idx1 = P(x - 2 * l2 / 3, y - l1 / 3);
+                    idx2 = P(x - l2 / 3, y - 2 * l1 / 3);
+                    idx3 = raw0;
+                    idx4 = raw1;
 
-                    verts = new List<Point3d> { vert0, vert1, vert2, vert3, vert4, vert5 };
-                    idxs = new List<int>();
-                    foreach (Point3d vert in verts)
-                    {
-                        Point3d r_vert = RoundPoint(vert);
-                        if (l_to_i.ContainsKey(r_vert))
-                        {
-                            idxs.Add(l_to_i[r_vert]);
-                        }
-                        else
-                        {
-                            int idx = mesh.Vertices.Add(vert);
-                            idxs.Add(idx);
-                            l_to_i.Add(r_vert, idx);
-                        }
-                    }
-
-                    mesh.Faces.AddFace(idxs[0], idxs[5], idxs[4], idxs[1]);
-                    mesh.Faces.AddFace(idxs[0], idxs[2], idxs[3], idxs[5]);
+                    mesh.Faces.AddFace(idx0, idx5, idx4, idx1);
+                    mesh.Faces.AddFace(idx0, idx2, idx3, idx5);
                 }
             }
 
-            public static void SeparatePinch(Mesh mesh, Mesh topology_source, int v, List<int> remove_face_at, Dictionary<Point3d, int> l_to_i)
+            public static void SeparatePinch(Mesh mesh, Mesh topology_source, int v, List<int> remove_face_at,
+                Dictionary<(long, long, long), int> pinch_registry, Point3d grid_origin, double x_dist, double y_dist)
             {
                 // See ConnectPinch: topology_source (never mutated) is read for
                 // TopologyVertices/TopologyEdges instead of mesh, to avoid a
@@ -4584,6 +4586,16 @@ namespace Sculpt2D
                 points.Add(edge3_vert2);
                 points.Add(edge4_vert2);
 
+                // points[0..3] are already-existing mesh vertices -- resolved
+                // to their raw index directly via topology instead of
+                // round-tripping their (already known) positions through
+                // GetOrAddPinchVertex.
+                int Raw(int topo) => topology_source.TopologyVertices.MeshVertexIndices(topo)[0];
+                int raw0 = Raw(edge1[0]);
+                int raw1 = Raw(edge2[0]);
+                int raw2 = Raw(edge3[1]);
+                int raw3 = Raw(edge4[1]);
+
                 Point3d shared_point = vert_list[v];
 
                 List<Vector2d> vectors = new List<Vector2d>();
@@ -4598,20 +4610,13 @@ namespace Sculpt2D
                         vectors.Add(vector);
                 }
 
-                Point3d vert0 = new Point3d();
-                Point3d vert1 = new Point3d();
-                Point3d vert2 = new Point3d();
-                Point3d vert3 = new Point3d();
-                Point3d vert4 = new Point3d();
-                Point3d vert5 = new Point3d();
-                Point3d vert6 = new Point3d();
                 double x = shared_point.X;
                 double y = shared_point.Y;
                 double l1 = Math.Sqrt(Math.Pow(vectors[0].X, 2) + Math.Pow(vectors[0].Y, 2));
                 double l2 = Math.Sqrt(Math.Pow(vectors[1].X, 2) + Math.Pow(vectors[1].Y, 2));
+                int P(double px, double py, double pz) => GetOrAddPinchVertex(mesh, pinch_registry, new Point3d(px, py, pz), grid_origin, x_dist, y_dist);
 
                 // remove faces that cause pinch points
-                MeshFace face = mesh.Faces[edge1_face[0]];
                 if (edge1_face[0] == edge2_face[0])
                 {
                     int face1_corner_idx = mesh.Faces[edge1_face[0]].A;
@@ -4625,72 +4630,34 @@ namespace Sculpt2D
                     x = shared_point.X;
                     y = shared_point.Y;
 
-                    vert0 = new Point3d((x + l2 / 3), (y + l1 / 3), shared_point.Z);
-                    vert1 = new Point3d((x + 2 * l2 / 3), (y + l1 / 3), shared_point.Z);
-                    vert2 = new Point3d((x + l2 / 3), (y + 2 * l1 / 3), shared_point.Z);
-                    vert3 = points[0];
-                    vert4 = points[1];
-                    vert5 = shared_point;
-                    vert6 = new Point3d((x + 2 * l2 / 3), (y + 2 * l1 / 3), shared_point.Z);
+                    int idx0 = P(x + l2 / 3, y + l1 / 3, shared_point.Z);
+                    int idx1 = P(x + 2 * l2 / 3, y + l1 / 3, shared_point.Z);
+                    int idx2 = P(x + l2 / 3, y + 2 * l1 / 3, shared_point.Z);
+                    int idx3 = raw0;
+                    int idx4 = raw1;
+                    int idx5 = face1_corner_idx;
+                    int idx6 = P(x + 2 * l2 / 3, y + 2 * l1 / 3, shared_point.Z);
 
-                    List<Point3d> verts = new List<Point3d> { vert0, vert1, vert2, vert3, vert4, vert5, vert6 };
-                    List<int> idxs = new List<int>();
-                    foreach (Point3d vert in verts)
-                    {
-                        Point3d r_vert = RoundPoint(vert);
-                        if (l_to_i.ContainsKey(r_vert))
-                        {
-                            idxs.Add(l_to_i[r_vert]);
-                        }
-                        else
-                        {
-                            int idx = mesh.Vertices.Add(vert);
-                            idxs.Add(idx);
-                            l_to_i.Add(r_vert, idx);
-                        }
-                    }
-
-                    mesh.Faces.AddFace(idxs[0], idxs[5], idxs[3], idxs[1]);
-                    mesh.Faces.AddFace(idxs[0], idxs[2], idxs[4], idxs[5]);
-
-                    mesh.Faces.AddFace(idxs[0], idxs[1], idxs[6], idxs[2]);
-
+                    mesh.Faces.AddFace(idx0, idx5, idx3, idx1);
+                    mesh.Faces.AddFace(idx0, idx2, idx4, idx5);
+                    mesh.Faces.AddFace(idx0, idx1, idx6, idx2);
 
                     // for top
                     shared_point = face2_corner;
                     x = shared_point.X;
                     y = shared_point.Y;
 
-                    vert0 = new Point3d((x - l2 / 3), (y - l1 / 3), shared_point.Z);
-                    vert1 = new Point3d((x - 2 * l2 / 3), (y - l1 / 3), shared_point.Z);
-                    vert2 = new Point3d((x - l2 / 3), (y - 2 * l1 / 3), shared_point.Z);
-                    vert3 = points[2];
-                    vert4 = points[3];
-                    vert5 = shared_point;
-                    vert6 = new Point3d((x - 2 * l2 / 3), (y - 2 * l1 / 3), shared_point.Z);
+                    idx0 = P(x - l2 / 3, y - l1 / 3, shared_point.Z);
+                    idx1 = P(x - 2 * l2 / 3, y - l1 / 3, shared_point.Z);
+                    idx2 = P(x - l2 / 3, y - 2 * l1 / 3, shared_point.Z);
+                    idx3 = raw2;
+                    idx4 = raw3;
+                    idx5 = face2_corner_idx;
+                    idx6 = P(x - 2 * l2 / 3, y - 2 * l1 / 3, shared_point.Z);
 
-                    verts = new List<Point3d> { vert0, vert1, vert2, vert3, vert4, vert5, vert6 };
-                    idxs = new List<int>();
-                    foreach (Point3d vert in verts)
-                    {
-                        Point3d r_vert = RoundPoint(vert);
-                        if (l_to_i.ContainsKey(r_vert))
-                        {
-                            idxs.Add(l_to_i[r_vert]);
-                        }
-                        else
-                        {
-                            int idx = mesh.Vertices.Add(vert);
-                            idxs.Add(idx);
-                            l_to_i.Add(r_vert, idx);
-                        }
-                    }
-
-                    mesh.Faces.AddFace(idxs[0], idxs[5], idxs[4], idxs[1]);
-                    mesh.Faces.AddFace(idxs[0], idxs[2], idxs[3], idxs[5]);
-
-                    mesh.Faces.AddFace(idxs[0], idxs[1], idxs[6], idxs[2]);
-
+                    mesh.Faces.AddFace(idx0, idx5, idx4, idx1);
+                    mesh.Faces.AddFace(idx0, idx2, idx3, idx5);
+                    mesh.Faces.AddFace(idx0, idx1, idx6, idx2);
 
                     //store faces to be removed
                     //remove_face_at.Add(edge1_face[0]);
@@ -4709,72 +4676,34 @@ namespace Sculpt2D
                     x = shared_point.X;
                     y = shared_point.Y;
 
-                    vert0 = new Point3d((x - l2 / 3), (y + l1 / 3), shared_point.Z);
-                    vert1 = new Point3d((x - 2 * l2 / 3), (y + l1 / 3), shared_point.Z);
-                    vert2 = new Point3d((x - l2 / 3), (y + 2 * l1 / 3), shared_point.Z);
-                    vert3 = points[2];
-                    vert4 = points[0];
-                    vert5 = shared_point;
-                    vert6 = new Point3d((x - 2 * l2 / 3), (y + 2 * l1 / 3), shared_point.Z);
+                    int idx0 = P(x - l2 / 3, y + l1 / 3, shared_point.Z);
+                    int idx1 = P(x - 2 * l2 / 3, y + l1 / 3, shared_point.Z);
+                    int idx2 = P(x - l2 / 3, y + 2 * l1 / 3, shared_point.Z);
+                    int idx3 = raw2;
+                    int idx4 = raw0;
+                    int idx5 = face1_corner_idx;
+                    int idx6 = P(x - 2 * l2 / 3, y + 2 * l1 / 3, shared_point.Z);
 
-                    List<Point3d> verts = new List<Point3d> { vert0, vert1, vert2, vert3, vert4, vert5, vert6 };
-                    List<int> idxs = new List<int>();
-                    foreach (Point3d vert in verts)
-                    {
-                        Point3d r_vert = RoundPoint(vert);
-                        if (l_to_i.ContainsKey(r_vert))
-                        {
-                            idxs.Add(l_to_i[r_vert]);
-                        }
-                        else
-                        {
-                            int idx = mesh.Vertices.Add(vert);
-                            idxs.Add(idx);
-                            l_to_i.Add(r_vert, idx);
-                        }
-                    }
+                    mesh.Faces.AddFace(idx0, idx1, idx4, idx5);
+                    mesh.Faces.AddFace(idx0, idx5, idx3, idx2);
+                    mesh.Faces.AddFace(idx0, idx2, idx6, idx1);
 
-                    mesh.Faces.AddFace(idxs[0], idxs[1], idxs[4], idxs[5]);
-                    mesh.Faces.AddFace(idxs[0], idxs[5], idxs[3], idxs[2]);
-
-                    mesh.Faces.AddFace(idxs[0], idxs[2], idxs[6], idxs[1]);
-
-
-                    // for top                      
+                    // for top
                     shared_point = face2_corner;
                     x = shared_point.X;
                     y = shared_point.Y;
 
-                    vert0 = new Point3d((x + l2 / 3), (y - l1 / 3), shared_point.Z);
-                    vert1 = new Point3d((x + 2 * l2 / 3), (y - l1 / 3), shared_point.Z);
-                    vert2 = new Point3d((x + l2 / 3), (y - 2 * l1 / 3), shared_point.Z);
-                    vert3 = points[1];
-                    vert4 = points[3];
-                    vert5 = shared_point;
-                    vert6 = new Point3d((x + 2 * l2 / 3), (y - 2 * l1 / 3), shared_point.Z);
+                    idx0 = P(x + l2 / 3, y - l1 / 3, shared_point.Z);
+                    idx1 = P(x + 2 * l2 / 3, y - l1 / 3, shared_point.Z);
+                    idx2 = P(x + l2 / 3, y - 2 * l1 / 3, shared_point.Z);
+                    idx3 = raw1;
+                    idx4 = raw3;
+                    idx5 = face2_corner_idx;
+                    idx6 = P(x + 2 * l2 / 3, y - 2 * l1 / 3, shared_point.Z);
 
-                    verts = new List<Point3d> { vert0, vert1, vert2, vert3, vert4, vert5, vert6 };
-                    idxs = new List<int>();
-                    foreach (Point3d vert in verts)
-                    {
-                        Point3d r_vert = RoundPoint(vert);
-                        if (l_to_i.ContainsKey(r_vert))
-                        {
-                            idxs.Add(l_to_i[r_vert]);
-                        }
-                        else
-                        {
-                            int idx = mesh.Vertices.Add(vert);
-                            idxs.Add(idx);
-                            l_to_i.Add(r_vert, idx);
-                        }
-                    }
-
-                    mesh.Faces.AddFace(idxs[0], idxs[1], idxs[4], idxs[5]);
-                    mesh.Faces.AddFace(idxs[0], idxs[5], idxs[3], idxs[2]);
-
-                    mesh.Faces.AddFace(idxs[0], idxs[2], idxs[6], idxs[1]);
-
+                    mesh.Faces.AddFace(idx0, idx1, idx4, idx5);
+                    mesh.Faces.AddFace(idx0, idx5, idx3, idx2);
+                    mesh.Faces.AddFace(idx0, idx2, idx6, idx1);
 
                     //store faces to be removed
                     //remove_face_at.Add(edge1_face[0]);
