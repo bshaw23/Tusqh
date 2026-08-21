@@ -526,8 +526,12 @@ namespace Sculpt2D.Components
                 {
                     int face = queue.Dequeue();
                     visited.Add(face);
+                    // NOTE: this used to also call
+                    // sculpted_mesh.Faces.GetConnectedFaces(face) here, but its
+                    // result was never used -- see GetConnectedFacesUnused()
+                    // below for why that call alone accounted for effectively
+                    // all of this component's runtime at fine grid resolution.
                     List<int> faces = Functions.GetAdjacentFaces(face, sculpted_mesh);
-                    int[] connected_faces = sculpted_mesh.Faces.GetConnectedFaces(face);
                     foreach(var f in faces)
                     {
                         if (!component.Contains(f))
@@ -651,6 +655,32 @@ namespace Sculpt2D.Components
             total_timer.Stop();
             timings.Add($"TOTAL: {total_timer.Elapsed.TotalMilliseconds:F3} ms");
             DA.SetDataList(7, timings);
+        }
+
+        /// <summary>
+        /// NEVER CALLED -- kept only for reference, not part of the
+        /// component's execution path.
+        ///
+        /// This is exactly the call that used to sit inside the "10 second
+        /// BFS: connected components" loop in SolveInstance (in the while
+        /// loop iterating the BFS queue, right after
+        /// `Functions.GetAdjacentFaces(face, sculpted_mesh)` is computed).
+        /// Its result (`connected_faces`) was computed but never read --
+        /// pure dead code. At x=240,y=315 that phase alone took ~150.5s
+        /// (99% of the component's total runtime) with ~28,490 faces
+        /// processed, while the equivalent first BFS (which never called
+        /// this) finished in ~84ms. Since GetConnectedFaces isn't backed by
+        /// a precomputed/cached adjacency structure the way
+        /// TopologyVertices/TopologyEdges are, calling it once per
+        /// dequeued face is consistent with effectively quadratic
+        /// behavior over the mesh's face count. Left here, unused, as a
+        /// record of what was removed and why -- do not call this from
+        /// SolveInstance again without first confirming the underlying
+        /// RhinoCommon call has been made cheap for repeated per-face use.
+        /// </summary>
+        private int[] GetConnectedFacesUnused(int face, Mesh sculpted_mesh)
+        {
+            return sculpted_mesh.Faces.GetConnectedFaces(face);
         }
 
         /// <summary>

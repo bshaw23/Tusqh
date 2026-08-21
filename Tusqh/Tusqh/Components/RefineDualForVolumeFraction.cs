@@ -218,8 +218,35 @@ namespace Sculpt2D.Components
             }
 
             // next, modify each quadrilateral face to be subdivided into 4 triangles
+            //
+            // Rebuilt as a single forward pass into a brand-new mesh instead
+            // of repeatedly removing the original quad from, and re-adding 4
+            // triangles to, the SAME growing mesh: MeshFaceList.RemoveAt
+            // shifts every face already appended after the removal point
+            // down by one, so each of these ~76k removals (at x=240,y=315)
+            // was re-shifting an ever-larger tail of already-added
+            // triangles -- an O(quads^2) cost that measured at ~226s, 99.4%
+            // of this component's total runtime at that resolution.
+            //
+            // This is output-preserving: quad_face.A/B/C/D always index the
+            // ORIGINAL (pre-subdivision) vertices, whose Z values were fixed
+            // by phase 02 and never touched again by this loop, so the
+            // per-corner min/max Z selection below depends only on those 4
+            // corner values -- never on what's happened to any other face or
+            // on iteration order. Iterating original face index from
+            // init_face_count-1 down to 0 (same order as before) and always
+            // appending the new centroid vertex/4 triangles to the new mesh
+            // reproduces the exact same vertex list, the exact same centroid
+            // indices (both start at the original vertex count and
+            // increment by one per face, in the same order), and the exact
+            // same face list and order as the original in-place loop --
+            // just without ever mutating a mesh's face list in place.
             int init_face_count = dual_mesh.Faces.Count;
-            for (int i = init_face_count - 1; i > -1; --i) 
+            Mesh subdivided_mesh = new Mesh();
+            for (int j = 0; j < dual_mesh.Vertices.Count; ++j)
+                subdivided_mesh.Vertices.Add(dual_mesh.Vertices[j]);
+
+            for (int i = init_face_count - 1; i > -1; --i)
             {
                 var quad_face = dual_mesh.Faces[i];
                 var centroid = dual_mesh.Faces.GetFaceCenter(i);
@@ -238,13 +265,14 @@ namespace Sculpt2D.Components
 
                 }
 
-                dual_mesh.Faces.RemoveAt(i, false);
-                int new_idx = dual_mesh.Vertices.Add(centroid);
-                dual_mesh.Faces.AddFace(quad_face.A, quad_face.B, new_idx);
-                dual_mesh.Faces.AddFace(quad_face.B, quad_face.C, new_idx);
-                dual_mesh.Faces.AddFace(quad_face.C, quad_face.D, new_idx);
-                dual_mesh.Faces.AddFace(quad_face.D, quad_face.A, new_idx);
+                int new_idx = subdivided_mesh.Vertices.Add(centroid);
+                subdivided_mesh.Faces.AddFace(quad_face.A, quad_face.B, new_idx);
+                subdivided_mesh.Faces.AddFace(quad_face.B, quad_face.C, new_idx);
+                subdivided_mesh.Faces.AddFace(quad_face.C, quad_face.D, new_idx);
+                subdivided_mesh.Faces.AddFace(quad_face.D, quad_face.A, new_idx);
             }
+
+            dual_mesh = subdivided_mesh;
 
             timings.Add($"03 quad-to-triangle subdivision ({init_face_count:N0} quads): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
