@@ -302,6 +302,10 @@ namespace Sculpt2D.Components
                 }
             }
 
+            timings.Add($"05b topo_vertex_to_faces lookup build ({original_face_count:N0} faces): "
+                + $"{phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             List<int> remove_face_at = new List<int>();
             List<int> added_faces = new List<int>();
 
@@ -358,6 +362,12 @@ namespace Sculpt2D.Components
                 return result.Value;
             }
 
+            Stopwatch connect_pinch_timer = new Stopwatch();
+            Stopwatch separate_pinch_timer = new Stopwatch();
+            Stopwatch removal_scan_timer = new Stopwatch();
+            int connect_pinch_calls = 0;
+            int separate_pinch_calls = 0;
+
             foreach (var set in connected_pinches)
             {
                 int separate_counter = 0;
@@ -399,7 +409,10 @@ namespace Sculpt2D.Components
                 {
                     foreach (int vert in set)
                     {
-                        Functions.ConnectPinch(output_mesh, vert, location_to_index);
+                        connect_pinch_timer.Start();
+                        Functions.ConnectPinch(output_mesh, input_mesh, vert, location_to_index);
+                        connect_pinch_timer.Stop();
+                        connect_pinch_calls++;
                     }
                 }
                 // Remove faces
@@ -407,8 +420,13 @@ namespace Sculpt2D.Components
                 {
                     foreach (int vert in set)
                     {
-                        Functions.SeparatePinch(output_mesh, vert, remove_face_at, location_to_index);
+                        separate_pinch_timer.Start();
+                        Functions.SeparatePinch(output_mesh, input_mesh, vert, remove_face_at, location_to_index);
+                        separate_pinch_timer.Stop();
+                        separate_pinch_calls++;
                     }
+
+                    removal_scan_timer.Start();
 
                     // Original faces: O(1) lookup per set member via the
                     // precomputed index instead of an O(faces) rescan.
@@ -447,8 +465,17 @@ namespace Sculpt2D.Components
                                 remove_face_at.Add(i);
                         }
                     }
+
+                    removal_scan_timer.Stop();
                 }
             }
+
+            timings.Add($"06a ConnectPinch ({connect_pinch_calls:N0} calls): "
+                + $"{connect_pinch_timer.Elapsed.TotalMilliseconds:F3} ms");
+            timings.Add($"06b SeparatePinch ({separate_pinch_calls:N0} calls): "
+                + $"{separate_pinch_timer.Elapsed.TotalMilliseconds:F3} ms");
+            timings.Add($"06c removal scan (lookup + tail rescan): "
+                + $"{removal_scan_timer.Elapsed.TotalMilliseconds:F3} ms");
 
             if (runtime_errors.Count > 0)
             {

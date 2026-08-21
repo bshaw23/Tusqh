@@ -4170,16 +4170,23 @@ namespace Sculpt2D
                 TryAddTemplateQuad(sculpted_mesh, generated_faces, v, se, e, ne);
             }
 
-            public static void ConnectPinch(Mesh mesh, int v, Dictionary<Point3d, int> l_to_i)
+            public static void ConnectPinch(Mesh mesh, Mesh topology_source, int v, Dictionary<Point3d, int> l_to_i)
             {
-                var vert_edges = mesh.TopologyVertices.ConnectedEdges(v);
+                // topology_source is read for all TopologyVertices/TopologyEdges
+                // lookups instead of mesh -- mesh gets mutated (AddFace/Vertices.Add)
+                // once per pinch vertex processed, and RhinoCommon rebuilds its
+                // topology cache from scratch the next time it's queried after a
+                // mutation, so querying the mutating mesh here would cost one full
+                // O(mesh size) rebuild per call. topology_source is never mutated,
+                // so its topology cache builds once and stays warm for every call.
+                var vert_edges = topology_source.TopologyVertices.ConnectedEdges(v);
                 //if (vert_edges.Length != 4)
                 //{
                 //    throw new Exception(string.Format("We somehow got a pinch point with {0} connected edges", vert_edges.Length));
                 //}
 
-                var edge_list = mesh.TopologyEdges;
-                var vert_list = mesh.TopologyVertices;
+                var edge_list = topology_source.TopologyEdges;
+                var vert_list = topology_source.TopologyVertices;
                 // made with assumption that
                 IndexPair edge1 = edge_list.GetTopologyVertices(vert_edges[0]); // edge1 is in positive y direction  from vertex
                 IndexPair edge2 = edge_list.GetTopologyVertices(vert_edges[1]);
@@ -4268,7 +4275,6 @@ namespace Sculpt2D
 
                     mesh.Faces.AddFace(idxs[0], idxs[1], idxs[4], idxs[5]);
                     mesh.Faces.AddFace(idxs[0], idxs[5], idxs[3], idxs[2]);
-                    mesh.Compact();
 
                     //edge2 corresponds to edge3
                     //create mesh on other side to make it nonmanifold
@@ -4297,7 +4303,6 @@ namespace Sculpt2D
 
                     mesh.Faces.AddFace(idxs[0], idxs[1], idxs[4], idxs[5]);
                     mesh.Faces.AddFace(idxs[0], idxs[5], idxs[3], idxs[2]);
-                    mesh.Compact();
                 }
                 else if (edge1_face[0] == edge3_face[0])
                 {
@@ -4329,7 +4334,6 @@ namespace Sculpt2D
 
                     mesh.Faces.AddFace(idxs[0], idxs[5], idxs[4], idxs[1]);
                     mesh.Faces.AddFace(idxs[0], idxs[2], idxs[3], idxs[5]);
-                    mesh.Compact();
 
                     //edge3 corresponds to edge4
                     vert0 = new Point3d((x - l2 / 3), (y - l1 / 3), shared_point.Z);
@@ -4357,14 +4361,16 @@ namespace Sculpt2D
 
                     mesh.Faces.AddFace(idxs[0], idxs[5], idxs[4], idxs[1]);
                     mesh.Faces.AddFace(idxs[0], idxs[2], idxs[3], idxs[5]);
-                    mesh.Compact();
                 }
             }
 
-            public static void SeparatePinch(Mesh mesh, int v, List<int> remove_face_at, Dictionary<Point3d, int> l_to_i)
+            public static void SeparatePinch(Mesh mesh, Mesh topology_source, int v, List<int> remove_face_at, Dictionary<Point3d, int> l_to_i)
             {
-                var vert_list = mesh.TopologyVertices;
-                var edge_list = mesh.TopologyEdges;
+                // See ConnectPinch: topology_source (never mutated) is read for
+                // TopologyVertices/TopologyEdges instead of mesh, to avoid a
+                // full topology-cache rebuild on every call.
+                var vert_list = topology_source.TopologyVertices;
+                var edge_list = topology_source.TopologyEdges;
                 var vert_edges = vert_list.ConnectedEdges(v);
                 //if (vert_edges.Length != 4)
                 //{
@@ -4437,9 +4443,6 @@ namespace Sculpt2D
                     Point3d face1_corner = mesh.Vertices[face1_corner_idx]; // bottom
                     Point3d face2_corner = mesh.Vertices[face2_corner_idx]; // top
 
-                    var connected_faces1 = vert_list.ConnectedFaces(face1_corner_idx);
-                    var connected_faces2 = vert_list.ConnectedFaces(face2_corner_idx);
-
                     // For bottom
                     shared_point = face1_corner;
                     x = shared_point.X;
@@ -4470,12 +4473,7 @@ namespace Sculpt2D
                         }
                     }
 
-                    int[] v_con_faces = vert_list.ConnectedFaces(face1_corner_idx);
-                    int[] connected_faces = mesh.TopologyEdges.GetConnectedFaces(mesh.TopologyEdges.GetEdgeIndex(face1_corner_idx, edge1[0]));
-                    //if (connected_faces.Count() == 2 || v_con_faces.Count() == 1 || v_con_faces.Count() == 4)
                     mesh.Faces.AddFace(idxs[0], idxs[5], idxs[3], idxs[1]);
-                    connected_faces = mesh.TopologyEdges.GetConnectedFaces(mesh.TopologyEdges.GetEdgeIndex(face1_corner_idx, edge2[0]));
-                    //if (connected_faces.Count() == 2 || v_con_faces.Count() == 1 || v_con_faces.Count() == 4)
                     mesh.Faces.AddFace(idxs[0], idxs[2], idxs[4], idxs[5]);
 
                     mesh.Faces.AddFace(idxs[0], idxs[1], idxs[6], idxs[2]);
@@ -4511,16 +4509,10 @@ namespace Sculpt2D
                         }
                     }
 
-                    v_con_faces = vert_list.ConnectedFaces(face2_corner_idx);
-                    connected_faces = edge_list.GetConnectedFaces(mesh.TopologyEdges.GetEdgeIndex(face2_corner_idx, edge4[1]));
-                    //if (connected_faces.Count() == 2 || v_con_faces.Count() == 1 || v_con_faces.Count() == 4)
                     mesh.Faces.AddFace(idxs[0], idxs[5], idxs[4], idxs[1]);
-                    connected_faces = edge_list.GetConnectedFaces(mesh.TopologyEdges.GetEdgeIndex(face2_corner_idx, edge3[1]));
-                    //if (connected_faces.Count() == 2 || v_con_faces.Count() == 1 || v_con_faces.Count() == 4)
                     mesh.Faces.AddFace(idxs[0], idxs[2], idxs[3], idxs[5]);
 
                     mesh.Faces.AddFace(idxs[0], idxs[1], idxs[6], idxs[2]);
-                    mesh.Compact();
 
 
                     //store faces to be removed
@@ -4534,9 +4526,6 @@ namespace Sculpt2D
 
                     Point3d face1_corner = mesh.Vertices[face1_corner_idx]; // bottom
                     Point3d face2_corner = mesh.Vertices[face2_corner_idx]; // top
-
-                    var connected_faces1 = vert_list.ConnectedFaces(face1_corner_idx);
-                    var connected_faces2 = vert_list.ConnectedFaces(face2_corner_idx);
 
                     // For bottom first
                     shared_point = face1_corner;
@@ -4568,16 +4557,10 @@ namespace Sculpt2D
                         }
                     }
 
-                    int[] v_con_faces = vert_list.ConnectedFaces(face1_corner_idx);
-                    int[] connected_faces = mesh.TopologyEdges.GetConnectedFaces(mesh.TopologyEdges.GetEdgeIndex(face1_corner_idx, edge1[0]));
-                    //if (connected_faces.Count() == 2 || v_con_faces.Count() == 1 || v_con_faces.Count() == 4)
                     mesh.Faces.AddFace(idxs[0], idxs[1], idxs[4], idxs[5]);
-                    connected_faces = mesh.TopologyEdges.GetConnectedFaces(mesh.TopologyEdges.GetEdgeIndex(face1_corner_idx, edge3[1]));
-                    //if (connected_faces.Count() == 2 || v_con_faces.Count() == 1 || v_con_faces.Count() == 4)
                     mesh.Faces.AddFace(idxs[0], idxs[5], idxs[3], idxs[2]);
 
                     mesh.Faces.AddFace(idxs[0], idxs[2], idxs[6], idxs[1]);
-                    mesh.Compact();
 
 
                     // for top                      
@@ -4610,16 +4593,10 @@ namespace Sculpt2D
                         }
                     }
 
-                    v_con_faces = vert_list.ConnectedFaces(face2_corner_idx);
-                    connected_faces = mesh.TopologyEdges.GetConnectedFaces(mesh.TopologyEdges.GetEdgeIndex(face2_corner_idx, edge4[1]));
-                    //if (connected_faces.Count() == 2 || v_con_faces.Count() == 1 || v_con_faces.Count() == 4)
                     mesh.Faces.AddFace(idxs[0], idxs[1], idxs[4], idxs[5]);
-                    connected_faces = mesh.TopologyEdges.GetConnectedFaces(mesh.TopologyEdges.GetEdgeIndex(face2_corner_idx, edge2[0]));
-                    //if (connected_faces.Count() == 2 || v_con_faces.Count() == 1 || v_con_faces.Count() == 4)
                     mesh.Faces.AddFace(idxs[0], idxs[5], idxs[3], idxs[2]);
 
                     mesh.Faces.AddFace(idxs[0], idxs[2], idxs[6], idxs[1]);
-                    mesh.Compact();
 
 
                     //store faces to be removed
