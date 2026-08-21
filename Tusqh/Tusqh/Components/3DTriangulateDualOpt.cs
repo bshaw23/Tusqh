@@ -138,7 +138,7 @@ namespace Sculpt2D.Components
         protected override void RegisterInputParams(GH_InputParamManager pManager)
         {
             pManager.AddPointParameter("Vertex List", "verts", "Vertices of Dual Mesh", GH_ParamAccess.list);
-            pManager.AddGenericParameter("Hexes", "hexes", "Dual hexes as lists of eight vertex indices", GH_ParamAccess.list);
+            pManager.AddIntegerParameter("Hexes", "hexes", "Vertex indices of dual hexes, flattened -- every 8 consecutive entries are one hex", GH_ParamAccess.list);
             pManager.AddNumberParameter("Volume Fractions", "vols", "Volume fractions in x-y-z structured-grid order", GH_ParamAccess.list);
             pManager.AddPointParameter("Centroids", "cents", "Centroids of the original structured hex mesh", GH_ParamAccess.list);
             pManager.AddNumberParameter("x distance", "xdist", "Original hex length in x", GH_ParamAccess.item);
@@ -167,7 +167,7 @@ namespace Sculpt2D.Components
             List<string> timings = new List<string>();
 
             List<Point3d> vertices = new List<Point3d>();
-            List<List<int>> hexes = new List<List<int>>();
+            List<int> hexes = new List<int>();
             List<double> volumeFractions = new List<double>();
             List<Point3d> centroids = new List<Point3d>();
             double xDist = 0;
@@ -231,14 +231,22 @@ namespace Sculpt2D.Components
                 return;
             }
 
+            if (hexes.Count % 8 != 0)
+            {
+                AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
+                    $"Hexes must be a flattened list with 8 entries per hex; received {hexes.Count:N0}, not a multiple of 8.");
+                return;
+            }
+            int hexCount = hexes.Count / 8;
+
             long dualNx = (long)nx + 1;
             long dualNy = (long)ny + 1;
             long dualNz = (long)nz + 1;
             long expectedHexes = dualNx * dualNy * dualNz;
-            if (expectedHexes != hexes.Count)
+            if (expectedHexes != hexCount)
             {
                 AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
-                    $"Structured dual-grid inference expected {expectedHexes:N0} hexes, but received {hexes.Count:N0}.");
+                    $"Structured dual-grid inference expected {expectedHexes:N0} hexes, but received {hexCount:N0}.");
                 return;
             }
 
@@ -247,7 +255,7 @@ namespace Sculpt2D.Components
                 dualNx * (dualNy + 1) * dualNz +
                 dualNx * dualNy * (dualNz + 1);
             int faceCapacity = checked((int)uniqueFaceCount);
-            int estimatedPointCount = checked(vertices.Count + hexes.Count + faceCapacity);
+            int estimatedPointCount = checked(vertices.Count + hexCount + faceCapacity);
             List<Point4d> points = new List<Point4d>(estimatedPointCount);
             for (int vertexIndex = 0; vertexIndex < vertices.Count; vertexIndex++)
             {
@@ -262,28 +270,23 @@ namespace Sculpt2D.Components
             timings.Add($"02 direct volume mapping ({vertices.Count:N0} vertices): {phaseTimer.Elapsed.TotalMilliseconds:F3} ms");
             phaseTimer.Restart();
 
-            int tetCount = checked(hexes.Count * 24);
+            int tetCount = checked(hexCount * 24);
             Tet4[] tets = new Tet4[tetCount];
             int tetWriteIndex = 0;
             Dictionary<QuadFaceKey, int> faceCentroidIndices =
                 new Dictionary<QuadFaceKey, int>(faceCapacity);
 
-            for (int hexIndex = 0; hexIndex < hexes.Count; hexIndex++)
+            for (int hexIndex = 0; hexIndex < hexCount; hexIndex++)
             {
-                List<int> hex = hexes[hexIndex];
-                if (hex == null || hex.Count != 8)
-                {
-                    AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
-                        $"Hex {hexIndex:N0} has {hex?.Count ?? 0} indices; expected 8.");
-                    return;
-                }
+                int hexBase = hexIndex * 8;
 
                 for (int corner = 0; corner < 8; corner++)
                 {
-                    if (hex[corner] < 0 || hex[corner] >= vertices.Count)
+                    int cornerValue = hexes[hexBase + corner];
+                    if (cornerValue < 0 || cornerValue >= vertices.Count)
                     {
                         AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
-                            $"Hex {hexIndex:N0}, corner {corner}, references vertex {hex[corner]:N0}; valid range is 0..{vertices.Count - 1:N0}.");
+                            $"Hex {hexIndex:N0}, corner {corner}, references vertex {cornerValue:N0}; valid range is 0..{vertices.Count - 1:N0}.");
                         return;
                     }
                 }
@@ -292,7 +295,7 @@ namespace Sculpt2D.Components
                 Point3d hexCentroid = Point3d.Origin;
                 for (int corner = 0; corner < 8; corner++)
                 {
-                    int index = hex[corner];
+                    int index = hexes[hexBase + corner];
                     hexCentroid += vertices[index];
                     hexValue = Combine(hexValue, points[index].W, useMin);
                 }
@@ -302,10 +305,10 @@ namespace Sculpt2D.Components
 
                 for (int faceIndex = 0; faceIndex < 6; faceIndex++)
                 {
-                    int a = hex[FaceCorners[faceIndex, 0]];
-                    int b = hex[FaceCorners[faceIndex, 1]];
-                    int c = hex[FaceCorners[faceIndex, 2]];
-                    int d = hex[FaceCorners[faceIndex, 3]];
+                    int a = hexes[hexBase + FaceCorners[faceIndex, 0]];
+                    int b = hexes[hexBase + FaceCorners[faceIndex, 1]];
+                    int c = hexes[hexBase + FaceCorners[faceIndex, 2]];
+                    int d = hexes[hexBase + FaceCorners[faceIndex, 3]];
                     QuadFaceKey key = new QuadFaceKey(a, b, c, d);
 
                     if (!faceCentroidIndices.TryGetValue(key, out int faceCentroidIndex))

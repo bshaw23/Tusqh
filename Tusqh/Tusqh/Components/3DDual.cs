@@ -47,7 +47,7 @@ namespace Sculpt2D.Components
         protected override void RegisterOutputParams(GH_Component.GH_OutputParamManager pManager)
         {
             pManager.AddPointParameter("Vertices", "verts", "Vertices of hexahedral dual mesh", GH_ParamAccess.list);             // 0
-            pManager.AddGenericParameter("Hexes", "hexes", "Hexes of dual mesh as list of vertex indicies", GH_ParamAccess.list);   // 1
+            pManager.AddIntegerParameter("Hexes", "hexes", "Vertex indices of dual mesh hexes, flattened -- every 8 consecutive entries are one hex", GH_ParamAccess.list);   // 1
             pManager.AddNumberParameter("x distance", "xdist", "length of hexes in x", GH_ParamAccess.item);                        // 2
             pManager.AddNumberParameter("y distance", "ydist", "length of hexes in y", GH_ParamAccess.item);                        // 3
             pManager.AddNumberParameter("z distance", "zdist", "length of hexes in z", GH_ParamAccess.item);                        // 4
@@ -206,37 +206,32 @@ namespace Sculpt2D.Components
             timings.Add($"02 dual coordinate construction: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
 
-            // Create Dual Surface Mesh
-            List<Line> mesh_grid = new List<Line>();
-            for (int i = 0; i < dual_xvals.Count; ++i)
-            {
-                for (int j = 0; j < dual_yvals.Count; ++j)
-                {
-                    for (int k = 1; k < dual_zvals.Count; ++k)
-                        mesh_grid.Add(new Line(dual_xvals[i], dual_yvals[j], dual_zvals[k-1], dual_xvals[i], dual_yvals[j], dual_zvals[k]));
-                }
-            }
-            for (int i = 0; i < dual_xvals.Count; ++i)
-            {
-                for (int k = 0; k < dual_zvals.Count; ++k)
-                {
-                    for(int j = 1; j < dual_yvals.Count; ++j)
-                        mesh_grid.Add(new Line(dual_xvals[i], dual_yvals[j-1], dual_zvals[k], dual_xvals[i], dual_yvals[j], dual_zvals[k]));
-                }
-            }
+            // Built directly by index instead of via a Line/NurbsCurve soup
+            // fed to Mesh.CreateFromLines, which was the dominant cost here.
+            // Iteration order (z fastest, then y, then x) matches the stride
+            // the hex connectivity below already assumes -- z + y*(z_div+2)
+            // + x*(z_div+2)*(y_div+2) -- so this lines up with those indices
+            // exactly, the same way dual_xvals/yvals/zvals.Count already
+            // equals x_div+2/y_div+2/z_div+2 (SubdivideDualIntervalList adds
+            // one point beyond the x_div/y_div/z_div+1 grid-line count).
+            List<Point3d> verts = new List<Point3d>();
+            for (int xi = 0; xi < dual_xvals.Count; ++xi)
+                for (int yi = 0; yi < dual_yvals.Count; ++yi)
+                    for (int zi = 0; zi < dual_zvals.Count; ++zi)
+                        verts.Add(new Point3d(dual_xvals[xi], dual_yvals[yi], dual_zvals[zi]));
 
-            NurbsCurve[] linecurves = new NurbsCurve[mesh_grid.Count];
-            for (int i = 0; i < mesh_grid.Count; ++i)
-                linecurves[i] = mesh_grid[i].ToNurbsCurve();
-
-            var dual_mesh = Mesh.CreateFromLines(linecurves, 4, 1e-6);
-            var topology_vertices = dual_mesh.TopologyVertices;
-
-            timings.Add($"03 line grid and dual mesh: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            timings.Add($"03 dual vertex construction (direct grid, {verts.Count:N0} verts): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
 
-            // Build hexes as list of vertex indicies
-            List<List<int>> hexes = new List<List<int>>();
+            // Vertex indices of each hex, flattened -- every 8 consecutive
+            // entries are one hex (hex h's corners are at [h*8, h*8+8)) --
+            // instead of one List<int> per hex, since publishing 500k+
+            // individual List<int> objects through a GenericParameter output
+            // forces Grasshopper to goo-wrap each one via reflection, which
+            // dominated this component's runtime at scale (~2s of ~2.9s
+            // total on a 572,330-hex grid).
+            int total_hexes = (x_div + 1) * (y_div + 1) * (z_div + 1);
+            List<int> hexes = new List<int>(total_hexes * 8);
             HashSet<int> z1 = new HashSet<int>();
             HashSet<int> z2 = new HashSet<int>();
             HashSet<int> y1 = new HashSet<int>();
@@ -259,7 +254,8 @@ namespace Sculpt2D.Components
                         int G = C + 1;
                         int H = D + 1;
 
-                        hexes.Add(new List<int> { A, B, C, D, E, F, G, H });
+                        hexes.Add(A); hexes.Add(B); hexes.Add(C); hexes.Add(D);
+                        hexes.Add(E); hexes.Add(F); hexes.Add(G); hexes.Add(H);
 
                         if (z == 0)
                             z1.Add(hex_counter);
@@ -279,76 +275,73 @@ namespace Sculpt2D.Components
                 }
             }
 
-            timings.Add($"04 hex connectivity ({hexes.Count:N0} hexes): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            timings.Add($"04 hex connectivity ({hex_counter:N0} hexes): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
-
-            List<Point3d> verts = new List<Point3d>();
-            foreach (Point3d vert in topology_vertices)
-                verts.Add(vert);
 
             List<Mesh> viz = new List<Mesh>();
             x_div++;
             y_div++;
             z_div++;
-            for (int i = 0; i < hexes.Count; i++)
+            for (int i = 0; i < hex_counter; i++)
             {
+                int h = i * 8;
                 if (z1.Contains(i)/*(i % z_div) == 0*/) // z1
                 {
                     Mesh mesh = new Mesh();
-                    mesh.Vertices.Add(verts[hexes[i][0]]);
-                    mesh.Vertices.Add(verts[hexes[i][3]]);
-                    mesh.Vertices.Add(verts[hexes[i][2]]);
-                    mesh.Vertices.Add(verts[hexes[i][1]]);
+                    mesh.Vertices.Add(verts[hexes[h + 0]]);
+                    mesh.Vertices.Add(verts[hexes[h + 3]]);
+                    mesh.Vertices.Add(verts[hexes[h + 2]]);
+                    mesh.Vertices.Add(verts[hexes[h + 1]]);
                     mesh.Faces.AddFace(0, 1, 2, 3);
                     viz.Add(mesh);
                 }
                 else if (z2.Contains(i)/*((i + 1) % z_div) == 0*/) // z2
                 {
                     Mesh mesh = new Mesh();
-                    mesh.Vertices.Add(verts[hexes[i][4]]);
-                    mesh.Vertices.Add(verts[hexes[i][5]]);
-                    mesh.Vertices.Add(verts[hexes[i][6]]);
-                    mesh.Vertices.Add(verts[hexes[i][7]]);
+                    mesh.Vertices.Add(verts[hexes[h + 4]]);
+                    mesh.Vertices.Add(verts[hexes[h + 5]]);
+                    mesh.Vertices.Add(verts[hexes[h + 6]]);
+                    mesh.Vertices.Add(verts[hexes[h + 7]]);
                     mesh.Faces.AddFace(0, 1, 2, 3);
                     viz.Add(mesh);
                 }
                 if (y1.Contains(i)/*(i % (z_div * y_div)) < z_div*/) // y1
                 {
                     Mesh mesh = new Mesh();
-                    mesh.Vertices.Add(verts[hexes[i][0]]);
-                    mesh.Vertices.Add(verts[hexes[i][1]]);
-                    mesh.Vertices.Add(verts[hexes[i][5]]);
-                    mesh.Vertices.Add(verts[hexes[i][4]]);
+                    mesh.Vertices.Add(verts[hexes[h + 0]]);
+                    mesh.Vertices.Add(verts[hexes[h + 1]]);
+                    mesh.Vertices.Add(verts[hexes[h + 5]]);
+                    mesh.Vertices.Add(verts[hexes[h + 4]]);
                     mesh.Faces.AddFace(0, 1, 2, 3);
                     viz.Add(mesh);
                 }
                 else if (y2.Contains(i)/*(i % (z_div * y_div)) >= ((y_div * z_div) - y_div)*/) // y2
                 {
                     Mesh mesh = new Mesh();
-                    mesh.Vertices.Add(verts[hexes[i][2]]);
-                    mesh.Vertices.Add(verts[hexes[i][3]]);
-                    mesh.Vertices.Add(verts[hexes[i][7]]);
-                    mesh.Vertices.Add(verts[hexes[i][6]]);
+                    mesh.Vertices.Add(verts[hexes[h + 2]]);
+                    mesh.Vertices.Add(verts[hexes[h + 3]]);
+                    mesh.Vertices.Add(verts[hexes[h + 7]]);
+                    mesh.Vertices.Add(verts[hexes[h + 6]]);
                     mesh.Faces.AddFace(0, 1, 2, 3);
                     viz.Add(mesh);
                 }
                 if (x1.Contains(i)/*(i % (z_div * y_div * x_div)) < (z_div * y_div)*/) // x1
                 {
                     Mesh mesh = new Mesh();
-                    mesh.Vertices.Add(verts[hexes[i][0]]);
-                    mesh.Vertices.Add(verts[hexes[i][4]]);
-                    mesh.Vertices.Add(verts[hexes[i][7]]);
-                    mesh.Vertices.Add(verts[hexes[i][3]]);
+                    mesh.Vertices.Add(verts[hexes[h + 0]]);
+                    mesh.Vertices.Add(verts[hexes[h + 4]]);
+                    mesh.Vertices.Add(verts[hexes[h + 7]]);
+                    mesh.Vertices.Add(verts[hexes[h + 3]]);
                     mesh.Faces.AddFace(0, 1, 2, 3);
                     viz.Add(mesh);
                 }
                 else if (x2.Contains(i)/*(i % (z_div * y_div * x_div)) >= ((x_div * y_div * z_div) - (y_div* z_div))*/) // x2
                 {
                     Mesh mesh = new Mesh();
-                    mesh.Vertices.Add(verts[hexes[i][1]]);
-                    mesh.Vertices.Add(verts[hexes[i][2]]);
-                    mesh.Vertices.Add(verts[hexes[i][6]]);
-                    mesh.Vertices.Add(verts[hexes[i][5]]);
+                    mesh.Vertices.Add(verts[hexes[h + 1]]);
+                    mesh.Vertices.Add(verts[hexes[h + 2]]);
+                    mesh.Vertices.Add(verts[hexes[h + 6]]);
+                    mesh.Vertices.Add(verts[hexes[h + 5]]);
                     mesh.Faces.AddFace(0, 1, 2, 3);
                     viz.Add(mesh);
                 }
@@ -358,9 +351,15 @@ namespace Sculpt2D.Components
             phase_timer.Restart();
 
             DA.SetDataList(0, verts);
+            timings.Add($"06a publish verts ({verts.Count:N0}): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             DA.SetDataList(1, hexes);
+            timings.Add($"06b publish hexes ({hex_counter:N0} hexes, {hexes.Count:N0} flat entries): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            phase_timer.Restart();
+
             DA.SetDataList(5, viz);
-            timings.Add($"06 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            timings.Add($"06c publish viz ({viz.Count:N0}): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             total_timer.Stop();
             timings.Add($"TOTAL (excluding timing output): {total_timer.Elapsed.TotalMilliseconds:F3} ms");
             DA.SetDataList(6, timings);

@@ -35,7 +35,7 @@ namespace Sculpt2D.Components
         protected override void RegisterInputParams(GH_Component.GH_InputParamManager pManager)
         {
             pManager.AddPointParameter("Vertex List", "verts", "Vertices of Dual Mesh", GH_ParamAccess.list);                   // 0
-            pManager.AddGenericParameter("Hexes", "hexes", "List of hexes as list of vertex indicies", GH_ParamAccess.list);    // 1
+            pManager.AddIntegerParameter("Hexes", "hexes", "Vertex indices of dual hexes, flattened -- every 8 consecutive entries are one hex", GH_ParamAccess.list);    // 1
             pManager.AddNumberParameter("Volume Fractions", "vols", "List of volume fractions", GH_ParamAccess.list);           // 2
             pManager.AddPointParameter("Centroids", "cents", "Centroids of original hex mesh", GH_ParamAccess.list);            // 3
             pManager.AddNumberParameter("x distance", "xdist", "Length of non-dual hexes in x-direction", GH_ParamAccess.item); // 4
@@ -71,7 +71,7 @@ namespace Sculpt2D.Components
             List<string> timings = new List<string>();
 
             List<Point3d> vertices = new List<Point3d>();
-            List<List<int>> hexes = new List<List<int>>();
+            List<int> flat_hexes = new List<int>();
             List<Point3d> centroids = new List<Point3d>();
             List<double> volume_fractions = new List<double>();
             double x_dist = 0;
@@ -82,7 +82,7 @@ namespace Sculpt2D.Components
             bool viz = false;
 
             DA.GetDataList(0, vertices);
-            DA.GetDataList(1, hexes);
+            DA.GetDataList(1, flat_hexes);
             DA.GetDataList(2, volume_fractions);
             DA.GetDataList(3, centroids);
             DA.GetData(4, ref x_dist);
@@ -91,6 +91,22 @@ namespace Sculpt2D.Components
             DA.GetData(7, ref negative);
             DA.GetData(8, ref use_min);
             DA.GetData(9, ref viz);
+
+            // 3DDual.cs now publishes Hexes flattened (every 8 consecutive
+            // entries are one hex, matching 3DTriangulateDualOpt.cs) instead
+            // of one List<int> per hex through a GenericParameter, which was
+            // dominating publish time at scale. Rebuilt into the per-hex
+            // shape here, unchanged, since that's still what the rest of
+            // this component (untouched) expects.
+            if (flat_hexes.Count % 8 != 0)
+            {
+                AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
+                    $"Hexes must be a flattened list with 8 entries per hex; received {flat_hexes.Count:N0}, not a multiple of 8.");
+                return;
+            }
+            List<List<int>> hexes = new List<List<int>>(flat_hexes.Count / 8);
+            for (int h = 0; h < flat_hexes.Count; h += 8)
+                hexes.Add(flat_hexes.GetRange(h, 8));
 
             timings.Add($"01 inputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
