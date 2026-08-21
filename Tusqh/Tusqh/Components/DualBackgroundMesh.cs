@@ -110,27 +110,31 @@ namespace Sculpt2D.Components
             List<double> dual_xvals = SubdivideDualIntervalList(x_pts);
             List<double> dual_yvals = SubdivideDualIntervalList(y_pts);
 
-            List<Line> mesh_grid = new List<Line>();
-            for (int i = 0; i < dual_xvals.Count; ++i)
+            // Built directly by index instead of via Mesh.CreateFromLines,
+            // which was the dominant cost here.
+            int dual_x_count = dual_xvals.Count;
+            int dual_y_count = dual_yvals.Count;
+            Mesh dual_mesh = new Mesh();
+            for (int j = 0; j < dual_y_count; ++j)
+                for (int i = 0; i < dual_x_count; ++i)
+                    dual_mesh.Vertices.Add(dual_xvals[i], dual_yvals[j], 0);
+
+            for (int j = 0; j < dual_y_count - 1; ++j)
             {
-                for(int j = 1; j < dual_yvals.Count; ++j)
-                    mesh_grid.Add(new Line(dual_xvals[i], dual_yvals[j-1], 0, dual_xvals[i], dual_yvals[j], 0));
+                for (int i = 0; i < dual_x_count - 1; ++i)
+                {
+                    int a = j * dual_x_count + i;
+                    int b = j * dual_x_count + (i + 1);
+                    int c = (j + 1) * dual_x_count + (i + 1);
+                    int d = (j + 1) * dual_x_count + i;
+                    dual_mesh.Faces.AddFace(a, b, c, d);
+                }
             }
-            for (int j = 0; j < dual_yvals.Count; ++j)
-            {
-                for(int i = 1; i < dual_xvals.Count; ++i)
-                    mesh_grid.Add(new Line(dual_xvals[i-1], dual_yvals[j], 0, dual_xvals[i], dual_yvals[j], 0));
-            }
-            NurbsCurve[] linecurves = new NurbsCurve[mesh_grid.Count];
-            for (int i = 0; i < mesh_grid.Count; ++i)
-                linecurves[i] = (mesh_grid[i].ToNurbsCurve());
+            dual_mesh.Normals.ComputeNormals();
+            dual_mesh.FaceNormals.ComputeFaceNormals();
 
-            timings.Add($"03 dual grid line construction ({mesh_grid.Count:N0} lines): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
-            phase_timer.Restart();
-
-            var dual_mesh = Mesh.CreateFromLines(linecurves, 4, 1e-6);
-
-            timings.Add($"04 dual mesh creation (CreateFromLines): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            timings.Add($"03 dual mesh construction (direct grid, {dual_mesh.Vertices.Count:N0} verts, "
+                + $"{dual_mesh.Faces.Count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
 
             //for(int i = 0; i < regular_mesh.TopologyVertices.Count; ++i)
@@ -198,7 +202,7 @@ namespace Sculpt2D.Components
             DA.SetData(0, regular_mesh);
             DA.SetData(1, dual_mesh);
 
-            timings.Add($"05 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            timings.Add($"04 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             total_timer.Stop();
             timings.Add($"TOTAL: {total_timer.Elapsed.TotalMilliseconds:F3} ms");
             DA.SetDataList(2, timings);
