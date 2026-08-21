@@ -50,17 +50,16 @@ namespace Sculpt2D.Components
             DA.GetDataList(1, volume_fractions);
             DA.GetData(2, ref fraction);
 
-            List<Rhino.Geometry.MeshFace> faces = new List<MeshFace>();
             Rhino.Geometry.Mesh sculpted_mesh = background_grid.DuplicateMesh();
 
             int num_faces = background_grid.Faces.Count;
-            for( int i = num_faces-1; i >= 0; --i)
+            List<int> faces_to_remove = new List<int>();
+            for (int i = 0; i < num_faces; ++i)
             {
-                if (volume_fractions[i] < fraction) // && !faces_to_add.Contains(i)
-                    sculpted_mesh.Faces.RemoveAt(i,true);
-                    //faces.Add(face);
-
+                if (volume_fractions[i] < fraction)
+                    faces_to_remove.Add(i);
             }
+            sculpted_mesh.Faces.DeleteFaces(faces_to_remove);
 
             DA.SetData(0, sculpted_mesh);
         }

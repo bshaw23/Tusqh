@@ -3545,20 +3545,197 @@ namespace Sculpt2D
                 return adjacent_hexes;
             }
 
-            public static List<int> GetAdjacentFaces(int face, Mesh mesh)
+            public enum VertexProvenanceKind { Background, Synthetic, Inconsistent }
+
+            // Classifies a topology vertex by the background-index provenance of
+            // its constituent raw vertices (a topology vertex can weld more than
+            // one raw vertex together). raw_to_background maps a raw vertex index
+            // to its background-mesh vertex index, or -1 for a synthetic
+            // (template-generated) vertex. Mirrors MakeManifold's
+            // ClassifyBackgroundIndex.
+            public static VertexProvenanceKind ClassifyTopologyVertexProvenance(
+                Mesh mesh, int topology_vertex, Func<int, int> raw_to_background, out int background_index)
             {
-                List<int> connected_faces = new List<int>();
-                List<int> vert_idxs = new List<int> { mesh.Faces[face].A, mesh.Faces[face].B, mesh.Faces[face].C, mesh.Faces[face].D };
-                foreach (int vert in vert_idxs)
+                background_index = -1;
+                int[] raw_indices = mesh.TopologyVertices.MeshVertexIndices(topology_vertex);
+                if (raw_indices.Length == 0)
+                    return VertexProvenanceKind.Inconsistent;
+
+                int? result = null;
+                foreach (int raw in raw_indices)
                 {
-                    int[] faces = mesh.TopologyVertices.ConnectedFaces(vert);
-                    connected_faces.AddRange(faces);
+                    int candidate = raw_to_background(raw);
+                    if (result == null)
+                        result = candidate;
+                    else if (result != candidate)
+                        return VertexProvenanceKind.Inconsistent;
                 }
 
-                connected_faces.GroupBy(x => x).Where(g => g.Count() > 0).Select(g => g.Key).ToList();
-                connected_faces.Remove(face);
+                if (result.Value == -1)
+                    return VertexProvenanceKind.Synthetic;
 
-                return connected_faces;
+                background_index = result.Value;
+                return VertexProvenanceKind.Background;
+            }
+
+            // Builds face components among active_faces using edge adjacency
+            // unconditionally, and vertex-only adjacency (two otherwise
+            // edge-disconnected face groups meeting at a single point) only when
+            // that vertex is a retained background vertex -- unlike plain
+            // vertex adjacency (mesh.TopologyVertices.ConnectedFaces, which
+            // merges through any shared corner regardless of classification),
+            // this keeps a template-defect pinch or an incidental corner touch
+            // at a discarded vertex from silently joining otherwise-separate
+            // regions. Diagnostics records vertices left unmerged due to
+            // synthetic or inconsistent provenance (unexpected), and
+            // retained-vertex merges outside MakeManifold's supported 2-fan/
+            // 4-edge pinch pattern -- an ordinary non-retained vertex-only
+            // contact is left separate silently, since that's expected, not a
+            // defect. Note this only catches a multi-group meeting at the
+            // point it's first discovered: if an earlier retained-vertex union
+            // elsewhere already merged the same two groups, a later point
+            // contact between them won't re-trigger a diagnostic even though
+            // it's geometrically still a pinch (component membership is still
+            // correct either way) -- the Stage-0 final-mesh diagnostic checks
+            // every vertex independently and remains the authority for that.
+            public static List<HashSet<int>> BuildFaceComponentsEdgeFirst(
+                Mesh mesh,
+                List<int> active_faces,
+                HashSet<int> active_faces_set,
+                Func<int, int> raw_to_background,
+                HashSet<int> verts_to_keep_set,
+                List<string> diagnostics)
+            {
+                // Iterative find with path compression and union by size --
+                // not recursive: a structured grid mesh's edges are typically
+                // iterated in an order that chains unions monotonically
+                // (face i with face i+1, etc.), which would otherwise recurse
+                // to a depth matching the face count (tens of thousands here)
+                // and risk a stack overflow.
+                int face_count = mesh.Faces.Count;
+                int[] parent = new int[face_count];
+                int[] size = new int[face_count];
+                for (int i = 0; i < face_count; i++)
+                {
+                    parent[i] = i;
+                    size[i] = 1;
+                }
+
+                int Find(int x)
+                {
+                    int root = x;
+                    while (parent[root] != root)
+                        root = parent[root];
+                    while (parent[x] != root)
+                    {
+                        int next = parent[x];
+                        parent[x] = root;
+                        x = next;
+                    }
+                    return root;
+                }
+
+                void Union(int a, int b)
+                {
+                    int ra = Find(a), rb = Find(b);
+                    if (ra == rb)
+                        return;
+                    if (size[ra] < size[rb])
+                    {
+                        int tmp = ra;
+                        ra = rb;
+                        rb = tmp;
+                    }
+                    parent[rb] = ra;
+                    size[ra] += size[rb];
+                }
+
+                MeshTopologyEdgeList edge_list = mesh.TopologyEdges;
+                for (int e = 0; e < edge_list.Count; e++)
+                {
+                    int[] efaces = edge_list.GetConnectedFaces(e);
+                    int first_active = -1;
+                    foreach (int f in efaces)
+                    {
+                        if (!active_faces_set.Contains(f))
+                            continue;
+                        if (first_active == -1)
+                            first_active = f;
+                        else
+                            Union(first_active, f);
+                    }
+                }
+
+                MeshTopologyVertexList vert_list = mesh.TopologyVertices;
+                for (int v = 0; v < vert_list.Count; v++)
+                {
+                    int[] vfaces = vert_list.ConnectedFaces(v);
+                    HashSet<int> roots = new HashSet<int>();
+                    foreach (int f in vfaces)
+                    {
+                        if (active_faces_set.Contains(f))
+                            roots.Add(Find(f));
+                    }
+
+                    if (roots.Count <= 1)
+                        continue;
+
+                    VertexProvenanceKind kind = ClassifyTopologyVertexProvenance(mesh, v, raw_to_background, out int bg_idx);
+                    switch (kind)
+                    {
+                        case VertexProvenanceKind.Inconsistent:
+                            diagnostics.Add($"Topology vertex {v}: {roots.Count} edge-disconnected face groups meet "
+                                + "at a vertex with inconsistent or unresolvable provenance -- left separate.");
+                            continue;
+                        case VertexProvenanceKind.Synthetic:
+                            diagnostics.Add($"Topology vertex {v}: {roots.Count} edge-disconnected face groups meet "
+                                + "at a synthetic (template-generated) vertex -- left separate, likely an upstream "
+                                + "template defect.");
+                            continue;
+                    }
+
+                    if (verts_to_keep_set.Contains(bg_idx))
+                    {
+                        // MakeManifold's ConnectPinch/SeparatePinch only
+                        // handle the classic diagonal pinch: exactly two
+                        // face-fans meeting through exactly four connected
+                        // edges. A retained vertex outside that pattern (a
+                        // three-or-more-fan junction, or an unusual edge
+                        // count) is still a real connection -- union it -- but
+                        // flag it, since MakeManifold isn't guaranteed to
+                        // resolve it correctly downstream.
+                        int[] vedges = vert_list.ConnectedEdges(v);
+                        if (roots.Count != 2 || vedges.Length != 4)
+                        {
+                            diagnostics.Add($"Topology vertex {v}: {roots.Count} edge-disconnected face groups "
+                                + $"(connected edges={vedges.Length}) merge at a retained background vertex outside "
+                                + "MakeManifold's supported 2-fan/4-edge pinch pattern -- verify downstream resolution.");
+                        }
+
+                        int root0 = -1;
+                        foreach (int r in roots)
+                        {
+                            if (root0 == -1)
+                                root0 = r;
+                            else
+                                Union(root0, r);
+                        }
+                    }
+                }
+
+                Dictionary<int, HashSet<int>> by_root = new Dictionary<int, HashSet<int>>();
+                foreach (int f in active_faces)
+                {
+                    int r = Find(f);
+                    if (!by_root.TryGetValue(r, out HashSet<int> comp))
+                    {
+                        comp = new HashSet<int>();
+                        by_root[r] = comp;
+                    }
+                    comp.Add(f);
+                }
+
+                return by_root.Values.ToList();
             }
 
             // Builds an undirected adjacency list from a set of edges. Split

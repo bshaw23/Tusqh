@@ -356,37 +356,31 @@ namespace Sculpt2D.Components
                 + $"{sculpted_mesh.Vertices.Count:N0} vertices preserved): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
 
-            List<HashSet<int>> components = new List<HashSet<int>>();
-            HashSet<int> visited = new HashSet<int>();
-            foreach (int f in faces_to_keep)
+            // Edge-first: two faces sharing a complete topology edge are
+            // always one component. A vertex-only touch (a point pinch) only
+            // joins components when that vertex is a retained background
+            // vertex. raw_to_background can't just be the identity: if
+            // background has any welded/duplicate-position raw vertices (not
+            // guaranteed for an externally-supplied mesh, even though the
+            // usual Mesh.CreateFromPlane grid has none), a bare identity
+            // mapping would make every raw index its own "background index,"
+            // so a topology vertex welding two coincident-but-distinct raw
+            // indices would always misclassify as Inconsistent. Instead, every
+            // raw vertex canonicalizes to its topology vertex's first raw
+            // index, so raw vertices genuinely welded together always agree.
+            int BackgroundRawToBackground(int raw)
             {
-                if (visited.Contains(f))
-                    continue;
-
-                HashSet<int> component = new HashSet<int>();
-                component.Add(f);
-                Queue<int> queue = new Queue<int>();
-                queue.Enqueue(f);
-
-                while(queue.Count > 0)
-                {
-                    int face = queue.Dequeue();
-                    visited.Add(face);
-                    List<int> connected_faces = Functions.GetAdjacentFaces(face, background);
-                    foreach(int i in connected_faces)
-                    {
-                        if (!component.Contains(i) && faces_to_keep_set.Contains(i))
-                        {
-                            queue.Enqueue(i);
-                            component.Add(i);
-                        }
-                    }
-                }
-
-                components.Add(component);
+                int topo = background.TopologyVertices.TopologyVertexIndex(raw);
+                int[] canonical = background.TopologyVertices.MeshVertexIndices(topo);
+                return canonical.Length > 0 ? canonical[0] : raw;
             }
+            List<string> phase06_diagnostics = new List<string>();
+            List<HashSet<int>> components = Functions.BuildFaceComponentsEdgeFirst(
+                background, faces_to_keep, faces_to_keep_set, BackgroundRawToBackground, verts_to_keep_set, phase06_diagnostics);
 
             timings.Add($"06 first BFS: connected components ({components.Count:N0} found): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            foreach (string diag in phase06_diagnostics)
+                timings.Add($"06b {diag}");
             phase_timer.Restart();
 
             // Identify exterior edges
@@ -601,42 +595,24 @@ namespace Sculpt2D.Components
                 timings.Add($"09b {diag}");
             phase_timer.Restart();
 
-            components = new List<HashSet<int>>();
-            visited = new HashSet<int>();
-            for (int i = 0; i < sculpted_mesh.Faces.Count; i++)
-            {
-                if (visited.Contains(i))
-                    continue;
-
-                HashSet<int> component = new HashSet<int>();
-                component.Add(i);
-                Queue<int> queue = new Queue<int>();
-                queue.Enqueue(i);
-
-                while(queue.Count != 0)
-                {
-                    int face = queue.Dequeue();
-                    visited.Add(face);
-                    // NOTE: this used to also call
-                    // sculpted_mesh.Faces.GetConnectedFaces(face) here, but its
-                    // result was never used -- see GetConnectedFacesUnused()
-                    // below for why that call alone accounted for effectively
-                    // all of this component's runtime at fine grid resolution.
-                    List<int> faces = Functions.GetAdjacentFaces(face, sculpted_mesh);
-                    foreach(var f in faces)
-                    {
-                        if (!component.Contains(f))
-                        {
-                            component.Add(f);
-                            queue.Enqueue(f);
-                        }
-                    }
-                }
-
-                components.Add(component);
-            }
+            // Same edge-first rule as phase 06, now on the post-bridging
+            // sculpted mesh with every current face active. A retained-vertex
+            // touch here is a genuine unresolved point pinch that MakeManifold
+            // will connect downstream -- it must stay one semantic component so
+            // phase 12 doesn't remove it as a "small" island. raw_to_background
+            // goes through vertex_provenance instead of the identity, since
+            // sculpted_mesh vertices include synthetic (template) ones absent
+            // from the background mesh.
+            List<int> all_sculpted_faces = Enumerable.Range(0, sculpted_mesh.Faces.Count).ToList();
+            HashSet<int> all_sculpted_faces_set = new HashSet<int>(all_sculpted_faces);
+            int RawToBackground(int raw) => (raw >= 0 && raw < vertex_provenance.Count) ? vertex_provenance[raw] : -1;
+            List<string> phase10_diagnostics = new List<string>();
+            components = Functions.BuildFaceComponentsEdgeFirst(
+                sculpted_mesh, all_sculpted_faces, all_sculpted_faces_set, RawToBackground, verts_to_keep_set, phase10_diagnostics);
 
             timings.Add($"10 second BFS: connected components ({components.Count:N0} found, {sculpted_mesh.Faces.Count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            foreach (string diag in phase10_diagnostics)
+                timings.Add($"10b {diag}");
             phase_timer.Restart();
 
             MeshTopologyVertexList topology_verts = sculpted_mesh.TopologyVertices;
@@ -688,24 +664,49 @@ namespace Sculpt2D.Components
             timings.Add($"11 face-to-background matching ({sculpted_mesh.Faces.Count:N0} x {background.Faces.Count:N0}): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
 
+            // Audit trail: one line per component, so a removal decision can
+            // be checked against rm1 (consider_components)/rm2
+            // (remove_components) directly instead of re-deriving it from the
+            // final mesh. Synthetic (connector/template) faces have no
+            // background match -- unlike before Stage 3, an edge-first
+            // component can legitimately mix background-derived and synthetic
+            // faces (e.g. a small retained-vertex pinch group awaiting
+            // MakeManifold), so they're counted separately rather than
+            // indexed unconditionally into the subcell score.
+            List<string> component_diagnostics = new List<string>();
             HashSet<int> remove_faces = new HashSet<int>();
+            int component_index = 0;
             foreach(var component in components)
             {
-                if (component.Count <= consider_components)
+                int total_faces = component.Count;
+                int background_faces = 0;
+                int synthetic_faces = 0;
+                int subcells_counter = 0;
+                string decision;
+                string reason;
+
+                if (total_faces > consider_components)
+                {
+                    decision = "kept";
+                    reason = $"total_faces exceeds rm1 ({consider_components:N0})";
+                }
+                else
                 {
                     List<int> back_comp = new List<int>();
                     foreach (int face in component)
                     {
-                        back_comp.Add(face_idx_to_background_idx[face]);
+                        if (face_idx_to_background_idx.TryGetValue(face, out int back_idx))
+                            back_comp.Add(back_idx);
                     }
+                    background_faces = back_comp.Count;
+                    synthetic_faces = total_faces - background_faces;
 
-                    int subcells_counter = 0;
                     foreach (int face in back_comp)
                     {
                         MeshFace f = background.Faces[face];
                         List<int> face_verts = new List<int> { f.A, f.B, f.C, f.D };
                         List<Tuple<int, int>> face_edges = new List<Tuple<int, int>>
-                        { new Tuple<int, int>(f.A, f.B), new Tuple<int, int>(f.B, f.C), 
+                        { new Tuple<int, int>(f.A, f.B), new Tuple<int, int>(f.B, f.C),
                           new Tuple<int, int>(f.D, f.C), new Tuple<int, int>(f.A, f.D) };
 
                         foreach(int v in face_verts)
@@ -720,12 +721,29 @@ namespace Sculpt2D.Components
                         }
                     }
 
+                    List<string> reason_parts = new List<string>();
+                    if (background_faces == 0 && total_faces > 0)
+                        reason_parts.Add("synthetic-only component (no background match)");
+
                     if (subcells_counter <= remove_components)
                     {
+                        decision = "removed";
+                        reason_parts.Add($"subcell score {subcells_counter:N0} <= rm2 ({remove_components:N0})");
                         foreach(var face in component)
                             remove_faces.Add(face);
                     }
+                    else
+                    {
+                        decision = "kept";
+                        reason_parts.Add($"subcell score {subcells_counter:N0} exceeds rm2 ({remove_components:N0})");
+                    }
+                    reason = string.Join("; ", reason_parts);
                 }
+
+                component_diagnostics.Add($"component {component_index}: total_faces={total_faces:N0}, "
+                    + $"background_faces={background_faces:N0}, synthetic_faces={synthetic_faces:N0}, "
+                    + $"subcells={subcells_counter:N0}, decision={decision}, reason={reason}");
+                component_index++;
             }
 
             // Same batch-removal fix as above: DeleteFaces in one pass
@@ -741,6 +759,8 @@ namespace Sculpt2D.Components
             sculpted_mesh = Functions.CompactWithProvenance(sculpted_mesh, ref vertex_provenance);
 
             timings.Add($"12 small-component removal ({remove_faces.Count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
+            foreach (string diag in component_diagnostics)
+                timings.Add($"12a {diag}");
             phase_timer.Restart();
 
             // Stage 0 diagnostic (no behavior change): report face-type
@@ -819,7 +839,16 @@ namespace Sculpt2D.Components
                 // the adjacency graph among its own connected faces (two
                 // faces adjacent if they share one of the vertex's own
                 // connected edges) and check it's a single component.
+                // Split by provenance: a retained/non-retained background
+                // pinch is expected here (MakeManifold resolves it either
+                // way), so it's not a failure on its own. Only synthetic and
+                // inconsistent-provenance pinches indicate an actual upstream
+                // defect -- see Refinement in the Stage 3 discussion.
                 int diag_non_manifold_vertices = 0;
+                int diag_retained_background_pinches = 0;
+                int diag_nonretained_background_pinches = 0;
+                int diag_synthetic_pinches = 0;
+                int diag_inconsistent_pinches = 0;
                 MeshTopologyVertexList diag_verts = sculpted_mesh.TopologyVertices;
                 for (int dv = 0; dv < diag_verts.Count; dv++)
                 {
@@ -855,13 +884,44 @@ namespace Sculpt2D.Components
                         roots.Add(find(pi));
 
                     if (roots.Count > 1)
+                    {
                         diag_non_manifold_vertices++;
+
+                        Functions.VertexProvenanceKind kind = Functions.ClassifyTopologyVertexProvenance(
+                            sculpted_mesh, dv, RawToBackground, out int bg_idx);
+                        switch (kind)
+                        {
+                            case Functions.VertexProvenanceKind.Synthetic:
+                                diag_synthetic_pinches++;
+                                break;
+                            case Functions.VertexProvenanceKind.Inconsistent:
+                                diag_inconsistent_pinches++;
+                                break;
+                            case Functions.VertexProvenanceKind.Background:
+                                if (verts_to_keep_set.Contains(bg_idx))
+                                    diag_retained_background_pinches++;
+                                else
+                                    diag_nonretained_background_pinches++;
+                                break;
+                        }
+                    }
+                }
+
+                if (diag_synthetic_pinches > 0 || diag_inconsistent_pinches > 0)
+                {
+                    AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
+                        $"{diag_synthetic_pinches + diag_inconsistent_pinches:N0} unexpected non-manifold vertex/vertices "
+                        + "found (synthetic template-generated or provenance-inconsistent) -- see Timings for detail.");
                 }
 
                 timings.Add($"12b STAGE-0 DIAGNOSTIC final mesh ({sculpted_mesh.Faces.Count:N0} faces): "
                     + $"triangle_faces={diag_triangle_faces:N0}, quad_faces={diag_quad_faces:N0}, "
                     + $"degenerate_faces={diag_degenerate_faces:N0}, duplicate_faces={diag_duplicate_faces:N0}, "
-                    + $"non_manifold_edges={diag_non_manifold_edges:N0}, non_manifold_vertices={diag_non_manifold_vertices:N0}"
+                    + $"non_manifold_edges={diag_non_manifold_edges:N0}, non_manifold_vertices={diag_non_manifold_vertices:N0} "
+                    + $"(retained_background={diag_retained_background_pinches:N0}, "
+                    + $"non_retained_background={diag_nonretained_background_pinches:N0}, "
+                    + $"synthetic={diag_synthetic_pinches:N0} [unexpected], "
+                    + $"inconsistent={diag_inconsistent_pinches:N0} [unexpected])"
                     + $": {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
                 phase_timer.Restart();
             }
