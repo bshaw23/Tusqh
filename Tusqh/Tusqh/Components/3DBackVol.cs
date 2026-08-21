@@ -37,9 +37,11 @@ namespace Sculpt2D.Components
             pManager.AddMeshParameter("Surface Mesh", "mesh", "Surface mesh to be sculpted", GH_ParamAccess.item);                                           // 7
             pManager.AddBooleanParameter("Reverse Orientation", "rev", "Use reverse orientation of the curves", GH_ParamAccess.item);                        // 8
             pManager.AddIntegerParameter("Method of Sample", "avg", "0 - average, 1 - average of positives, 2 - average of negatives", GH_ParamAccess.item); // 9
+            pManager.AddBooleanParameter("Output Winding Diagnostics", "diag", "Compute and output the per-query-point Sample Points and Winding Numbers. Expensive at high resolution (one entry per query point); off by default.", GH_ParamAccess.item); // 10
             pManager[7].Optional = true;
             pManager[8].Optional = true;
             pManager[9].Optional = true;
+            pManager[10].Optional = true;
         }
 
         /// <summary>
@@ -97,6 +99,7 @@ namespace Sculpt2D.Components
             int avg_int = 0;
             MethodOfAverage avg = MethodOfAverage.Average;
             bool compute_vols = true;
+            bool output_winding_diagnostics = false;
 
             DA.GetData(0, ref box);
             DA.GetData(1, ref x_div);
@@ -111,6 +114,8 @@ namespace Sculpt2D.Components
                 reverse_boundary_orient = false;
             if (!DA.GetData(9, ref avg_int))
                 avg_int = 0;
+            if (!DA.GetData(10, ref output_winding_diagnostics))
+                output_winding_diagnostics = false;
 
             timings.Add($"01 inputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
@@ -143,7 +148,7 @@ namespace Sculpt2D.Components
             List<Point3d> point_grid = new List<Point3d>();
             List<Point3d> centroids = new List<Point3d>();
             List<Tuple<double, double, double>> querry_pts = new List<Tuple<double, double, double>>(x_div * y_div * z_div * x_pts * y_pts * z_pts);
-            List<double> pt_winding = new List<double>(querry_pts.Capacity);
+            List<double> pt_winding = new List<double>(output_winding_diagnostics ? querry_pts.Capacity : 0);
 
             timings.Add($"03 background mesh/setup: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
@@ -179,7 +184,8 @@ namespace Sculpt2D.Components
                                     double z_querry = point_a.Z + z_segments / 2 + z_segments * k;
 
                                     querry_pts.Add(new Tuple<double, double, double>(x_querry, y_querry, z_querry));
-                                    point_grid.Add(new Point3d(x_querry, y_querry, z_querry));
+                                    if (output_winding_diagnostics)
+                                        point_grid.Add(new Point3d(x_querry, y_querry, z_querry));
                                 }
                             }
                         }
@@ -234,7 +240,8 @@ namespace Sculpt2D.Components
                         else if (cur_wind <= 0 && avg == MethodOfAverage.AveragePositive)
                             cur_wind = 0;
                         volume_fraction += cur_wind;
-                        pt_winding.Add(cur_wind);
+                        if (output_winding_diagnostics)
+                            pt_winding.Add(cur_wind);
                     }
                     volume_fraction /= divisor;
                     volume_fractions.Add(volume_fraction);
@@ -255,13 +262,19 @@ namespace Sculpt2D.Components
 
             DA.SetData(0, background_mesh);
             DA.SetDataList(2, centroids);
-            DA.SetDataList(3, point_grid);
             DA.SetDataList(5, divs);
+            if (output_winding_diagnostics)
+                DA.SetDataList(3, point_grid);
             if (compute_vols)
             {
                 DA.SetDataList(1, volume_fractions);
-                DA.SetDataList(4, pt_winding);
+                if (output_winding_diagnostics)
+                    DA.SetDataList(4, pt_winding);
             }
+
+            timings.Add(output_winding_diagnostics
+                ? $"Sample Points/Winding Numbers: included ({querry_pts.Count:N0} points)"
+                : "Sample Points/Winding Numbers: skipped (Output Winding Diagnostics is off)");
 
             timings.Add($"08 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             total_timer.Stop();
