@@ -3798,6 +3798,58 @@ namespace Sculpt2D
                 return true;
             }
 
+            // Stage 2: rebuilds `mesh`, keeping only vertices referenced by
+            // at least one current face and remapping face indices
+            // consistently -- the same end state as Mesh.Compact() or a
+            // compacting DeleteFaces -- but carries `provenance` (a list
+            // parallel to mesh.Vertices going in) through the exact same
+            // remap, so it still lines up with the returned mesh's vertex
+            // order coming out. Use this instead of Compact()/compacting
+            // DeleteFaces anywhere a vertex's background-index provenance
+            // needs to survive the cleanup.
+            public static Mesh CompactWithProvenance(Mesh mesh, ref List<int> provenance)
+            {
+                int vcount = mesh.Vertices.Count;
+                bool[] referenced = new bool[vcount];
+                foreach (MeshFace f in mesh.Faces)
+                {
+                    referenced[f.A] = true;
+                    referenced[f.B] = true;
+                    referenced[f.C] = true;
+                    if (f.IsQuad)
+                        referenced[f.D] = true;
+                }
+
+                int[] old_to_new = new int[vcount];
+                List<int> new_provenance = new List<int>();
+                Mesh new_mesh = new Mesh();
+                int next = 0;
+                for (int i = 0; i < vcount; i++)
+                {
+                    if (referenced[i])
+                    {
+                        old_to_new[i] = next++;
+                        new_mesh.Vertices.Add(mesh.Vertices[i]);
+                        new_provenance.Add(provenance[i]);
+                    }
+                    else
+                    {
+                        old_to_new[i] = -1;
+                    }
+                }
+
+                foreach (MeshFace f in mesh.Faces)
+                {
+                    if (f.IsQuad)
+                        new_mesh.Faces.AddFace(old_to_new[f.A], old_to_new[f.B], old_to_new[f.C], old_to_new[f.D]);
+                    else
+                        new_mesh.Faces.AddFace(old_to_new[f.A], old_to_new[f.B], old_to_new[f.C]);
+                }
+
+                provenance = new_provenance;
+                return new_mesh;
+            }
+
             // Replaces the old per-path ConnectByVertexPath. Consolidates
             // every accepted path (across every component pair) into one
             // canonical set of unique bridge edges before meshing anything,

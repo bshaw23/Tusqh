@@ -52,6 +52,9 @@ namespace Sculpt2D.Components
             pManager.AddMeshParameter("Face Visualization", "f_viz", "Face visualization", GH_ParamAccess.item);
             pManager.AddMeshParameter("Final Mesh", "mesh", "Final anti-aliasing", GH_ParamAccess.item);
             pManager.AddTextParameter("Timings", "time", "Per-phase wall-clock timings in milliseconds", GH_ParamAccess.list);
+            pManager.AddIntegerParameter("Background Vertex Map", "bg_map",
+                "For each Final Mesh vertex, in order: its background-mesh vertex index, or -1 if it's a synthetic "
+                + "(template-generated) vertex with no background counterpart", GH_ParamAccess.list);
         }
 
         /// <summary>
@@ -575,7 +578,22 @@ namespace Sculpt2D.Components
             Functions.ConnectBridgeGraph(background, sculpted_mesh, faces_to_keep, all_accepted_paths,
                 diag_x_dist, diag_y_dist, bridge_diagnostics);
 
-            sculpted_mesh.Compact();
+            // Stage 2 provenance: valid to compute this simply -- as
+            // "background index if < background.Vertices.Count, else
+            // synthetic" -- specifically because phase 05's DeleteFaces
+            // used compact:false, so background vertex index i is still
+            // guaranteed to be sculpted_mesh vertex index i right here,
+            // and everything ConnectBridgeGraph added via
+            // GetOrAddTemplateVertex is unambiguously new (appended after
+            // that point). From here on, every vertex-count-changing
+            // operation must carry this list through via
+            // CompactWithProvenance instead of Compact()/a compacting
+            // DeleteFaces, or this simple rule stops holding.
+            List<int> vertex_provenance = new List<int>(sculpted_mesh.Vertices.Count);
+            for (int vi = 0; vi < sculpted_mesh.Vertices.Count; vi++)
+                vertex_provenance.Add(vi < background.Vertices.Count ? vi : -1);
+
+            sculpted_mesh = Functions.CompactWithProvenance(sculpted_mesh, ref vertex_provenance);
 
             timings.Add($"09 trapezoid connection (ConnectBridgeGraph, {all_accepted_paths.Count:N0} paths flattened): "
                 + $"{phase_timer.Elapsed.TotalMilliseconds:F3} ms");
@@ -712,7 +730,15 @@ namespace Sculpt2D.Components
 
             // Same batch-removal fix as above: DeleteFaces in one pass
             // instead of RemoveAt(i, true) recompacting per call.
-            sculpted_mesh.Faces.DeleteFaces(remove_faces.ToList());
+            // compact:false + CompactWithProvenance (Stage 2), not a plain
+            // compacting DeleteFaces, so vertex_provenance stays aligned
+            // with sculpted_mesh's vertices through this cleanup too --
+            // this is the second of the two vertex-count-changing steps
+            // after phase 09; both must go through the provenance-aware
+            // path or the published Background Vertex Map output would
+            // silently stop matching Final Mesh's actual vertex order.
+            sculpted_mesh.Faces.DeleteFaces(remove_faces.ToList(), false);
+            sculpted_mesh = Functions.CompactWithProvenance(sculpted_mesh, ref vertex_provenance);
 
             timings.Add($"12 small-component removal ({remove_faces.Count:N0} faces): {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             phase_timer.Restart();
@@ -840,12 +866,20 @@ namespace Sculpt2D.Components
                 phase_timer.Restart();
             }
 
+            if (vertex_provenance.Count != sculpted_mesh.Vertices.Count)
+            {
+                timings.Add($"WARNING: vertex_provenance.Count ({vertex_provenance.Count:N0}) != "
+                    + $"sculpted_mesh.Vertices.Count ({sculpted_mesh.Vertices.Count:N0}) at publish -- "
+                    + "Background Vertex Map output will not line up with Final Mesh's vertices");
+            }
+
             DA.SetDataList(0, verts_to_keep);
             DA.SetDataList(1, edges_to_keep);
             DA.SetDataList(2, faces_to_keep);
             DA.SetDataList(3, vert_viz);
             DA.SetDataList(4, edge_viz);
             DA.SetData(6, sculpted_mesh);
+            DA.SetDataList(8, vertex_provenance);
 
             timings.Add($"13 publish outputs: {phase_timer.Elapsed.TotalMilliseconds:F3} ms");
             total_timer.Stop();
